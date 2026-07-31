@@ -19,10 +19,13 @@ Thread(target=web, daemon=True).start()
 
 BOT_TOKEN = "8258187122:AAF0qdhmiuX29smYszqFIgrs_iVgWF_rpUo"
 ADMIN_ID = 8721023843
-API_URL_OLD = "https://keyherlyswar.x10.mx/Apidocs/reg/reglq.php"  # API cũ
-TANGACC_TOKEN = "https://tangacc.net/token.php"                   # API mới - lấy token
-TANGACC_ACC   = "https://tangacc.net/get_lq_acc.php"               # API mới - lấy acc
-CONCURRENT = 20
+API_OLD = "https://keyherlyswar.x10.mx/Apidocs/reg/reglq.php"
+TANGACC_TOKEN = "https://tangacc.net/token.php"
+TANGACC_ACC   = "https://tangacc.net/get_lq_acc.php"
+CONCURRENT_OLD = 50
+CONCURRENT_TANGACC = 30
+TIMEOUT_OLD = 5
+TIMEOUT_TANGACC = 8
 OUTPUT_DIR = "lq_data"
 JSONBIN_API_KEY = "$2a$10$ZKItx9kCcaQktuLuBDKY1ewYhT2gy3OWH.w7nkeTLWUy9sCxtjVWO"
 JSONBIN_BIN_ID = "6a6b41e8da38895dfea40e00"
@@ -35,8 +38,6 @@ TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
-TANGACC_TIMEOUT = 10       # Timeout cho API tangacc
-TANGACC_CONCURRENT = 15    # Số lượng request đồng thời tới tangacc
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -47,7 +48,7 @@ keys = {}
 users = {}
 used_accounts = set()
 
-# ===== jsonbin functions (giữ nguyên) =====
+# ======================== JSONBIN ========================
 async def load_data_from_bin():
     if not JSONBIN_BIN_ID: return None
     headers = {"X-Master-Key": JSONBIN_API_KEY}
@@ -89,119 +90,92 @@ async def safe_save(full=False):
         data = {"keys": keys, "users": users, "used_accounts": list(used_accounts)}
         await save_data_to_bin(data)
 
-# ===== API CŨ (giữ nguyên) =====
-async def get_acc_old(session, sem):
-    async with sem:
-        try:
-            async with session.get(API_URL_OLD, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"},
-                                   timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    if d.get("status") and d.get("result"):
-                        a = d["result"][0]
-                        return f"{a['account']}|{a['password']}"
-        except: pass
-    return ""
+# ======================== PRODUCERS ========================
+async def producer_old(session, sem, queue, stop_event):
+    while not stop_event.is_set():
+        async with sem:
+            if stop_event.is_set(): break
+            try:
+                async with session.get(API_OLD, headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"},
+                                       timeout=aiohttp.ClientTimeout(total=TIMEOUT_OLD)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if data.get("status") and data.get("result"):
+                            acc = f"{data['result'][0]['account']}|{data['result'][0]['password']}"
+                            if acc not in used_accounts:
+                                used_accounts.add(acc)
+                                await queue.put(acc)
+            except: pass
 
-async def fetch_old_batch(n, sem):
-    unique = []
-    conn = aiohttp.TCPConnector(limit=0)
-    async with aiohttp.ClientSession(connector=conn) as s:
-        while len(unique) < n:
-            tasks = [get_acc_old(s, sem) for _ in range(CONCURRENT)]
-            results = await asyncio.gather(*tasks)
-            for r in results:
-                if r and r not in used_accounts and r not in unique:
-                    unique.append(r); used_accounts.add(r)
-                    if len(unique) >= n: break
-    return unique
+async def producer_tangacc(session, sem_token, sem_acc, queue, stop_event):
+    used_tokens = set()
+    while not stop_event.is_set():
+        async with sem_token:
+            if stop_event.is_set(): break
+            try:
+                async with session.get(TANGACC_TOKEN, headers={"User-Agent":"Mozilla/5.0"},
+                                       timeout=aiohttp.ClientTimeout(total=TIMEOUT_TANGACC)) as r:
+                    token = (await r.text()).strip()
+                    if not token or token in used_tokens:
+                        continue
+                    used_tokens.add(token)
+            except: continue
 
-# ===== API MỚI (tangacc) - async, xử lý WAIT =====
-async def fetch_tangacc_token(session, sem, used_tokens_set):
-    async with sem:
-        try:
-            async with session.get(TANGACC_TOKEN, headers={"User-Agent":"Mozilla/5.0","Accept":"*/*"},
-                                   timeout=aiohttp.ClientTimeout(total=TANGACC_TIMEOUT)) as r:
-                token = (await r.text()).strip()
-                if token and token not in used_tokens_set:
-                    used_tokens_set.add(token)
-                    return token
-        except: pass
-    return None
+        async with sem_acc:
+            if stop_event.is_set(): break
+            try:
+                headers = {"User-Agent":"Mozilla/5.0","Content-Type":"application/x-www-form-urlencoded","Origin":"https://tangacc.net"}
+                async with session.post(TANGACC_ACC, data={"token": token}, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=TIMEOUT_TANGACC)) as r:
+                    resp = (await r.text()).strip()
+                    if "|" in resp and not resp.startswith("WAIT") and resp != "Lỗi.":
+                        if resp not in used_accounts:
+                            used_accounts.add(resp)
+                            await queue.put(resp)
+                    elif resp.startswith("WAIT"):
+                        parts = resp.split("|")
+                        sec = 30
+                        if len(parts) > 1 and parts[1].isdigit():
+                            sec = int(parts[1])
+                        log.warning(f"Tangacc yêu cầu đợi {sec}s")
+                        await asyncio.sleep(sec + 1)
+            except: pass
 
-async def fetch_tangacc_acc(session, sem, token):
-    async with sem:
-        headers = {"User-Agent":"Mozilla/5.0","Content-Type":"application/x-www-form-urlencoded","Origin":"https://tangacc.net"}
-        try:
-            async with session.post(TANGACC_ACC, data={"token": token}, headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=TANGACC_TIMEOUT)) as r:
-                return (await r.text()).strip()
-        except: return None
+# ======================== HÀM LẤY ACC ========================
+async def fetch_fast(n):
+    result_queue = asyncio.Queue()
+    stop_event = asyncio.Event()
+    sem_old = asyncio.Semaphore(CONCURRENT_OLD)
+    sem_token = asyncio.Semaphore(CONCURRENT_TANGACC)
+    sem_acc   = asyncio.Semaphore(CONCURRENT_TANGACC)
 
-async def get_acc_tangacc(session, sem_token, sem_acc, used_tokens_local):
-    """Lấy 1 acc từ tangacc, trả về string 'user|pass' hoặc None"""
-    token = await fetch_tangacc_token(session, sem_token, used_tokens_local)
-    if not token:
-        return None
-    resp = await fetch_tangacc_acc(session, sem_acc, token)
-    if resp is None:
-        return None
-    if "|" in resp and not resp.startswith("WAIT") and resp != "Lỗi.":
-        return resp
-    elif resp.startswith("WAIT"):
-        # Parse thời gian chờ
-        parts = resp.split("|")
-        wait_sec = 30
-        if len(parts) > 1 and parts[1].isdigit():
-            wait_sec = int(parts[1])
-        log.warning(f"Tangacc yêu cầu đợi {wait_sec}s")
-        await asyncio.sleep(wait_sec + 1)
-        return None  # Thất bại, sẽ thử lại sau
-    return None
-
-async def fetch_tangacc_batch(n, sem_token, sem_acc):
-    """Lấy n acc từ tangacc, xử lý lặp khi gặp WAIT"""
-    unique = []
-    used_tokens_local = set()
     conn = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=conn) as session:
-        while len(unique) < n:
-            # Tạo nhiều task để lấy song song
-            tasks = []
-            for _ in range(min(TANGACC_CONCURRENT, n - len(unique))):
-                tasks.append(asyncio.create_task(get_acc_tangacc(session, sem_token, sem_acc, used_tokens_local)))
-            results = await asyncio.gather(*tasks)
-            for acc in results:
-                if acc and acc not in used_accounts and acc not in unique:
-                    unique.append(acc)
-                    used_accounts.add(acc)
-                    if len(unique) >= n:
-                        break
-    return unique[:n]
+        # Khởi động producer
+        tasks = []
+        for _ in range(10):  # 10 producer OLD
+            tasks.append(asyncio.create_task(producer_old(session, sem_old, result_queue, stop_event)))
+        for _ in range(5):   # 5 producer TANGACC
+            tasks.append(asyncio.create_task(producer_tangacc(session, sem_token, sem_acc, result_queue, stop_event)))
 
-# ===== HÀM LẤY ACC KẾT HỢP CẢ 2 API =====
-async def fetch_fast(n):
-    """Lấy n acc, kết hợp cả API cũ và API mới"""
-    # Semaphore riêng cho từng API
-    sem_old = asyncio.Semaphore(CONCURRENT)
-    sem_token = asyncio.Semaphore(TANGACC_CONCURRENT)
-    sem_acc   = asyncio.Semaphore(TANGACC_CONCURRENT)
+        collected = []
+        while len(collected) < n:
+            try:
+                acc = await asyncio.wait_for(result_queue.get(), timeout=15)
+                collected.append(acc)
+                if len(collected) >= n:
+                    break
+            except asyncio.TimeoutError:
+                log.warning("Hết thời gian chờ acc từ 2 API")
+                break
 
-    # Chạy cả hai API đồng thời
-    old_task = asyncio.create_task(fetch_old_batch(n, sem_old))
-    new_task = asyncio.create_task(fetch_tangacc_batch(n, sem_token, sem_acc))
+        stop_event.set()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return collected[:n]
 
-    # Kết quả sẽ được cập nhật vào used_accounts bởi từng hàm
-    await asyncio.wait([old_task, new_task], return_when=asyncio.FIRST_COMPLETED)
-
-    # Lấy kết quả từ old (nhanh hơn) trước, nếu chưa đủ thì bổ sung từ new
-    accs_old = await old_task
-    accs_new = await new_task
-
-    combined = accs_old + [a for a in accs_new if a not in accs_old]
-    return combined[:n]
-
-# ===== Các hàm helper và handler giữ nguyên =====
+# ======================== CÁC HÀM KHÁC GIỮ NGUYÊN ========================
 request_log = defaultdict(list)
 muted_users = {}
 processing_users = set()
@@ -246,7 +220,7 @@ def main_menu(uid):
         [InlineKeyboardButton("👤 Profile", callback_data="profile")],
         [InlineKeyboardButton("🔑 Nhập Key Mới", callback_data="key_input")],
     ]
-    return InlineKeyboardMarkup(keyboard), f"🤖 *LQ ACC BOT*\n{vip}\n📊 Hôm nay: {used}/{limit} (Còn {remaining})\nChọn chức năng:"
+    return InlineKeyboardMarkup(keyboard), f"🤖 *LQ ACC BOT*\n{vip}\n📊 Hôm nay: {used}/{limit} (Còn {remaining})\n⚡Dual API\nChọn chức năng:"
 
 def admin_menu_text():
     return "👑 *ADMIN*\n/genkey|/genvip|/status|/users|/stats|/keys\n/muted|/unmute|/ban|/unban|/revoke|/reset|/delkey|/resetall"
@@ -257,7 +231,7 @@ def login_menu():
         [InlineKeyboardButton("🔗 Lấy Key Free", url="https://t.me/chantuiii")],
     ])
 
-# ===== Các handler Telegram (giữ nguyên, chỉ thay đổi khi gọi fetch_fast) =====
+# ======================== HANDLERS ========================
 async def start(update, context):
     uid = update.effective_user.id
     if uid != ADMIN_ID and check_spam(uid): await update.message.reply_text("🚫 Bạn đã bị cấm chat 60 giây vì spam!"); return
@@ -315,10 +289,6 @@ async def button_handler(update, context):
         vip = "👑 Admin" if uid == ADMIN_ID else ("👑 VIP" if u.get("vip") else "🔑 Thường")
         await query.edit_message_text(f"👤 {vip}\n📊 {u.get('daily_used',0)}/{limit}\n📦 Tổng: {u.get('used',0)}\n📋 Lịch sử: {len(u.get('history',[]))} acc")
     elif data == "key_input": await query.edit_message_text("📝 Gửi key của bạn: /key <mã>")
-
-# Giữ nguyên tất cả handler còn lại (key_cmd, lay, export, profile, getkey, genkey, genvip, ...)
-# Chúng không thay đổi, bạn copy nguyên từ code cũ vào đây.
-# (Do giới hạn độ dài, tôi không paste lại toàn bộ, nhưng bạn hãy giữ nguyên các hàm đó)
 
 async def key_cmd(update, context):
     uid = str(update.effective_user.id)
@@ -512,7 +482,7 @@ async def resetall(update, context):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE): log.exception(context.error)
 
 if __name__ == "__main__":
-    log.info(f"🤖 LQ ACC BOT | Admin:{ADMIN_ID} | ⚡{CONCURRENT} req (2 nguồn)")
+    log.info(f"🤖 LQ ACC BOT | Admin:{ADMIN_ID} | Dual API (OLD+TANGACC)")
     asyncio.run(initialize_data())
 
     app_bot = Application.builder().token(BOT_TOKEN).build()
