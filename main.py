@@ -8,7 +8,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
-# ======================== FLASK KEEP-ALIVE ========================
+# ======================== FLASK ========================
 app = Flask(__name__)
 
 @app.route("/")
@@ -40,8 +40,8 @@ TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
-CHECK_TIMEOUT = 10
-CHECK_CONCURRENT = 30
+CHECK_TIMEOUT = 8
+CHECK_CONCURRENT = 100
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -57,7 +57,7 @@ keys_lock = threading.Lock()
 users_lock = threading.Lock()
 acc_lock = threading.Lock()
 spam_lock = threading.Lock()
-data_lock = threading.Lock()      # bảo vệ save/load
+data_lock = threading.Lock()
 processing_lock = threading.Lock()
 
 # ======================== GLOBAL DATA ========================
@@ -77,9 +77,8 @@ def today_vn():
 def is_admin(uid):
     return uid == ADMIN_ID
 
-# ======================== INTERNAL HELPERS (lock-free khi gọi) ========================
+# ======================== INTERNAL HELPERS ========================
 def _clean_expired_keys_nolock():
-    """Xóa key hết hạn, phải gọi khi đã giữ keys_lock"""
     now = time.time()
     expired = [k for k, v in keys.items() if now - v.get("created_ts", 0) > KEY_EXPIRE_SECONDS]
     for k in expired:
@@ -89,7 +88,6 @@ def _clean_expired_keys_nolock():
     return bool(expired)
 
 def _get_user_copy(uid):
-    """Trả về bản sao dữ liệu user để đọc an toàn (phải giữ users_lock)"""
     if uid == ADMIN_ID:
         if "admin" not in users:
             users["admin"] = {"history":[],"used":0,"daily_used":0,"banned":False,"vip":True,"last_acc":[],"checked_acc":[]}
@@ -119,10 +117,8 @@ def load_data():
                 return
         except Exception as e:
             log.error(f"Lỗi tải bin: {e}")
-        # Nếu lỗi, giữ nguyên trạng thái hiện tại
 
 def save_data():
-    """Ghi dữ liệu ra JSONBin, không được gọi khi đang giữ lock khác"""
     with data_lock:
         for attempt in range(3):
             try:
@@ -201,7 +197,9 @@ def fetch_fast(n):
         stop_flag.set()
     return live_accs[:n]
 
-# ======================== CHECK ACC ========================
+# ======================== CHECK ACC (SIÊU TỐC) ========================
+check_executor = ThreadPoolExecutor(max_workers=200)
+
 def check_acc_api(username, password):
     try:
         r = requests.post(CHECK_API_URL,
@@ -233,12 +231,11 @@ def check_acc_api(username, password):
             return {"status": "MISS", "username": username,
                     "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
     except Exception as e:
-        log.error(f"Lỗi check_acc_api: {e}")
         return {"status": "ERROR", "username": username, "message": str(e)}
 
 async def check_acc_async(username, password):
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, check_acc_api, username, password)
+    return await loop.run_in_executor(check_executor, check_acc_api, username, password)
 
 # ======================== SPAM ========================
 request_log = defaultdict(list)
@@ -326,14 +323,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     name = user.full_name or user.username or str(uid)
-    # Chỉ lưu nếu tên thay đổi
     need_save = False
     with users_lock:
         if str(uid) in users:
             if users[str(uid)].get("name") != name:
                 users[str(uid)]["name"] = name
                 need_save = True
-        # Không thay đổi gì khác, không cần lưu
     if need_save:
         save_data()
     if uid == ADMIN_ID:
@@ -354,7 +349,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
     data = query.data
 
-    # Xác thực
     with users_lock:
         auth = (uid == ADMIN_ID) or (str(uid) in users and users[str(uid)].get("key") is not None)
         if not auth and data != "key_input":
@@ -412,6 +406,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ Không lấy được acc.")
                 return
 
+            # GHI ĐÈ last_acc
             with users_lock:
                 if uid == ADMIN_ID:
                     u = users.setdefault("admin", {"history":[],"used":0,"daily_used":0,"banned":False,"vip":True,"last_acc":[],"checked_acc":[]})
@@ -422,19 +417,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u["history"] = hist
                 u["used"] = u.get("used", 0) + len(accs)
                 u["daily_used"] = u.get("daily_used", 0) + len(accs)
-                last = u.get("last_acc", [])
-                last.extend(accs)
-                if len(last) > MAX_LAST_ACC:
-                    last = last[-MAX_LAST_ACC:]
-                u["last_acc"] = last
-                # Lưu bản sao để dùng ngoài lock
-                last_copy = list(last)
-                total_acc = len(last_copy)
+                u["last_acc"] = accs.copy()
+                last_copy = list(accs)
+                total_acc = len(accs)
 
             if need_save:
                 save_data()
 
-            # Chuẩn bị nút check
             with users_lock:
                 if uid == ADMIN_ID:
                     check_rem = 99999
@@ -450,7 +439,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             acc_text = "\n".join(last_copy[:20])
             if total_acc > 20:
                 acc_text += f"\n... và {total_acc-20} acc khác"
-            msg = f"🎉 +{len(accs)} acc (tổng {total_acc} acc) ({t1:.1f}s)\n\n{acc_text}"
+            msg = f"🎉 {len(accs)} acc ({t1:.1f}s)\n\n{acc_text}"
             if len(msg) > 4000:
                 msg = msg[:4000] + "\n... (cắt bớt)"
             reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
@@ -471,7 +460,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with users_lock:
                 u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"last_acc":[]})
-                acc_list = list(u.get("last_acc", []))  # copy
+                acc_list = list(u.get("last_acc", []))
                 if not acc_list:
                     await query.edit_message_text("⚠️ Vui lòng lấy acc trước để sử dụng tính năng check.")
                     return
@@ -486,7 +475,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 accs_to_check = acc_list[:can_check]
 
-            # Gửi tin nhắn chờ
             await query.edit_message_text(f"🔍 Đang check {can_check} acc...")
             t0 = time.time()
             sem = asyncio.Semaphore(CHECK_CONCURRENT)
@@ -517,7 +505,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if len(checked) > MAX_CHECKED_ACC:
                         checked = checked[-MAX_CHECKED_ACC:]
                     u["checked_acc"] = checked
-                # Xóa acc đã check
+                # Xóa acc đã check khỏi last_acc (giữ lại phần còn lại)
                 if len(acc_list) > can_check:
                     u["last_acc"] = acc_list[can_check:]
                 else:
@@ -642,7 +630,6 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data()
         await update.message.reply_text("❌ Key đã hết hạn (24h). Vui lòng lấy key mới.")
         return
-    # Tạo user
     with users_lock:
         users[uid] = {
             "key": key, "vip": is_vip, "used": 0, "daily_used": 0,
@@ -715,13 +702,9 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["history"] = hist
             u["used"] = u.get("used", 0) + len(accs)
             u["daily_used"] = u.get("daily_used", 0) + len(accs)
-            last = u.get("last_acc", [])
-            last.extend(accs)
-            if len(last) > MAX_LAST_ACC:
-                last = last[-MAX_LAST_ACC:]
-            u["last_acc"] = last
-            last_copy = list(last)
-            total_acc = len(last_copy)
+            u["last_acc"] = accs.copy()
+            last_copy = list(accs)
+            total_acc = len(accs)
         if uid != ADMIN_ID:
             save_data()
         with users_lock:
@@ -739,7 +722,7 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         acc_text = "\n".join(last_copy[:20])
         if total_acc > 20:
             acc_text += f"\n... và {total_acc-20} acc khác"
-        text = f"🎉 +{len(accs)} acc (tổng {total_acc} acc)\n\n{acc_text}"
+        text = f"🎉 {len(accs)} acc\n\n{acc_text}"
         reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
         await msg.edit_text(text, reply_markup=reply_markup)
     finally:
