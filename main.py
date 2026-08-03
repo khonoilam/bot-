@@ -6,9 +6,8 @@ from flask import Flask
 from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.constants import ParseMode
 
-# ======================== FLASK ========================
+# ======================== FLASK KEEP-ALIVE ========================
 app = Flask(__name__)
 
 @app.route("/")
@@ -40,8 +39,8 @@ TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
-CHECK_TIMEOUT = 15
-CHECK_CONCURRENT = 50
+CHECK_TIMEOUT = 30          # tăng timeout cho Render
+CHECK_CONCURRENT = 5        # giảm concurrent tránh rate limit
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -196,44 +195,55 @@ def fetch_fast(n):
         stop_flag.set()
     return live_accs[:n]
 
-# ======================== CHECK ACC (AIOHTTP ASYNC) ========================
+# ======================== CHECK ACC (AIOHTTP) ========================
 async def check_acc_aiohttp(session: aiohttp.ClientSession, username: str, password: str) -> dict:
-    try:
-        async with session.post(
-            CHECK_API_URL,
-            data={"user": username, "pass": password, "apikey": CHECK_API_KEY},
-            timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT)
-        ) as resp:
-            if resp.status != 200:
-                return {"status": "ERROR", "username": username, "message": f"HTTP {resp.status}"}
-            d = await resp.json()
-            if d.get("ok") and d["result"].get("status") == "HIT":
-                info = d["result"]
-                skins = info.get("aov_skins", {})
-                ban_info = info.get("aov_banned", "NO")
-                ban_start = info.get("ban_start", "")
-                ban_end = info.get("ban_end", "")
-                if isinstance(ban_info, dict):
-                    ban_start = ban_info.get("start", ban_start)
-                    ban_end = ban_info.get("end", ban_end)
-                    ban_status = "YES" if ban_info.get("status") == "banned" else "NO"
+    for retry in range(4):
+        try:
+            async with session.post(
+                CHECK_API_URL,
+                data={"user": username, "pass": password, "apikey": CHECK_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT)
+            ) as resp:
+                if resp.status in (429, 502, 503):
+                    await asyncio.sleep(2 ** retry)
+                    continue
+                if resp.status != 200:
+                    return {"status": "ERROR", "username": username, "message": f"HTTP {resp.status}"}
+                d = await resp.json()
+                if d.get("ok") and d["result"].get("status") == "HIT":
+                    info = d["result"]
+                    skins = info.get("aov_skins", {})
+                    ban_info = info.get("aov_banned", "NO")
+                    ban_start = info.get("ban_start", "")
+                    ban_end = info.get("ban_end", "")
+                    if isinstance(ban_info, dict):
+                        ban_start = ban_info.get("start", ban_start)
+                        ban_end = ban_info.get("end", ban_end)
+                        ban_status = "YES" if ban_info.get("status") == "banned" else "NO"
+                    else:
+                        ban_status = ban_info
+                    return {
+                        "status": "HIT", "username": username, "name": info.get("aov_name"),
+                        "uid": info.get("uid"), "rank": info.get("aov_rank"), "level": info.get("aov_level"),
+                        "skins": skins.get("total_skins", 0), "champs": skins.get("total_champs", 0),
+                        "banned": ban_status, "ban_start": ban_start, "ban_end": ban_end,
+                        "fb_linked": info.get("fb_linked"), "mobile_bound": info.get("mobile_bound"),
+                        "email_verified": info.get("email_verified"),
+                    }
                 else:
-                    ban_status = ban_info
-                return {
-                    "status": "HIT", "username": username, "name": info.get("aov_name"),
-                    "uid": info.get("uid"), "rank": info.get("aov_rank"), "level": info.get("aov_level"),
-                    "skins": skins.get("total_skins", 0), "champs": skins.get("total_champs", 0),
-                    "banned": ban_status, "ban_start": ban_start, "ban_end": ban_end,
-                    "fb_linked": info.get("fb_linked"), "mobile_bound": info.get("mobile_bound"),
-                    "email_verified": info.get("email_verified"),
-                }
-            else:
-                return {"status": "MISS", "username": username,
-                        "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
-    except asyncio.TimeoutError:
-        return {"status": "ERROR", "username": username, "message": "Timeout"}
-    except Exception as e:
-        return {"status": "ERROR", "username": username, "message": str(e)}
+                    return {"status": "MISS", "username": username,
+                            "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
+        except asyncio.TimeoutError:
+            if retry < 3:
+                await asyncio.sleep(2 ** retry)
+                continue
+            return {"status": "ERROR", "username": username, "message": "Timeout sau 4 lần thử"}
+        except Exception as e:
+            if retry < 3:
+                await asyncio.sleep(2 ** retry)
+                continue
+            return {"status": "ERROR", "username": username, "message": str(e)}
+    return {"status": "ERROR", "username": username, "message": "Thất bại sau 4 lần thử"}
 
 # ======================== SPAM ========================
 request_log = defaultdict(list)
@@ -257,7 +267,7 @@ def check_spam(uid):
             return True
     return False
 
-# ======================== MENUS ========================
+# ======================== MENUS (TEXT THUẦN) ========================
 def main_menu(uid):
     with users_lock:
         u = _get_user_copy(uid)
@@ -282,28 +292,32 @@ def main_menu(uid):
          InlineKeyboardButton("📁 Xuất Acc Check", callback_data="export_checked")],
         [InlineKeyboardButton("👤 Profile", callback_data="profile")],
     ]
-    text = (f"🤖 *LQ ACC BOT*\n{vip_text}\n"
-            f"📊 Hôm nay: {used}/{limit} (Còn {remaining})\n"
-            f"🔍 Check: {check_rem} lượt\n"
-            "⚡TangAcc\nChọn chức năng:")
+    text = (
+        f"🤖 LQ ACC BOT\n{vip_text}\n"
+        f"📊 Hôm nay: {used}/{limit} (Còn {remaining})\n"
+        f"🔍 Check: {check_rem} lượt\n"
+        "⚡TangAcc\nChọn chức năng:"
+    )
     return InlineKeyboardMarkup(keyboard), text
 
 def admin_menu_text():
-    return ("👑 *ADMIN MENU*\n\n"
-            "/genkey - Tạo key thường (24h)\n"
-            "/genvip - Tạo key VIP (24h)\n"
-            "/status - Trạng thái key & user\n"
-            "/users - Danh sách người dùng\n"
-            "/stats - Thống kê\n"
-            "/keys - Key chưa dùng\n"
-            "/muted - Danh sách mute\n"
-            "/unmute <id> - Bỏ mute\n"
-            "/ban <id> - Khóa người dùng\n"
-            "/unban <id> - Mở khóa\n"
-            "/revoke <id> - Thu hồi key\n"
-            "/reset <id> - Reset lượt dùng\n"
-            "/delkey <key> - Xóa key\n"
-            "/resetall CONFIRM - Xóa toàn bộ dữ liệu")
+    return (
+        "👑 ADMIN MENU\n\n"
+        "/genkey - Tạo key thường (24h)\n"
+        "/genvip - Tạo key VIP (24h)\n"
+        "/status - Trạng thái key & user\n"
+        "/users - Danh sách người dùng\n"
+        "/stats - Thống kê\n"
+        "/keys - Key chưa dùng\n"
+        "/muted - Danh sách mute\n"
+        "/unmute <id> - Bỏ mute\n"
+        "/ban <id> - Khóa người dùng\n"
+        "/unban <id> - Mở khóa\n"
+        "/revoke <id> - Thu hồi key\n"
+        "/reset <id> - Reset lượt dùng\n"
+        "/delkey <key> - Xóa key\n"
+        "/resetall CONFIRM - Xóa toàn bộ dữ liệu"
+    )
 
 def login_menu():
     return InlineKeyboardMarkup([
@@ -330,16 +344,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if need_save:
         save_data()
     if uid == ADMIN_ID:
-        await update.message.reply_text(admin_menu_text(), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(admin_menu_text())
     else:
         with users_lock:
             auth = (str(uid) in users and users[str(uid)].get("key") is not None)
         if auth:
             kb, text = main_menu(uid)
-            await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(text, reply_markup=kb)
         else:
-            await update.message.reply_text("🤖 *LQ ACC BOT*\n\n🔐 Chưa có key.\n👉 Nhấn nút dưới.",
-                                            reply_markup=login_menu(), parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "🤖 LQ ACC BOT\n\n🔐 Chưa có key.\n👉 Nhấn nút dưới.",
+                reply_markup=login_menu()
+            )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -443,7 +459,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, reply_markup=reply_markup)
             # Gửi menu chính riêng
             kb, menu_text = main_menu(uid)
-            await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
         finally:
             with processing_lock:
                 processing_users.discard(uid)
@@ -458,7 +474,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             processing_users.add(uid)
         try:
-            # Lưu original message để cập nhật sau
             original_msg = query.message
             with users_lock:
                 u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"last_acc":[]})
@@ -477,11 +492,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 accs_to_check = acc_list[:can_check]
 
-            # Gửi tin nhắn chờ mới (KHÔNG sửa original_msg)
             wait_msg = await context.bot.send_message(chat_id=uid, text=f"🔍 Đang check {can_check} acc...")
             t0 = time.time()
 
-            # Thực hiện check
             sem = asyncio.Semaphore(CHECK_CONCURRENT)
             async with aiohttp.ClientSession() as session:
                 async def limited_check(acc_str):
@@ -498,7 +511,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success_results = [r for r in results if r["status"] in ("HIT", "MISS")]
             hit_acc_strs = [accs_to_check[i] for i, r in enumerate(results) if r["status"] == "HIT"]
 
-            # Cập nhật dữ liệu
             with users_lock:
                 u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"history":[],"last_acc":[],"checked_acc":[],"last_check_date":"","checked_today":0})
                 if success_results:
@@ -513,7 +525,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if len(checked) > MAX_CHECKED_ACC:
                         checked = checked[-MAX_CHECKED_ACC:]
                     u["checked_acc"] = checked
-                # Xóa acc đã check khỏi last_acc
                 if len(acc_list) > can_check:
                     new_last = acc_list[can_check:]
                 else:
@@ -522,7 +533,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if uid != ADMIN_ID:
                 save_data()
 
-            # Cập nhật original message với danh sách acc mới và nút check mới
+            # Cập nhật original message
             with users_lock:
                 u2 = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
                 new_total = len(new_last)
@@ -545,12 +556,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.error(f"Không thể cập nhật tin nhắn gốc: {e}")
 
-            # Soạn kết quả check
             hit = [r for r in results if r["status"] == "HIT"]
             miss = [r for r in results if r["status"] != "HIT"]
-            text = f"📊 *Kết quả check {len(results)} acc ({t1:.1f}s)*\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
+            text = f"📊 Kết quả check {len(results)} acc ({t1:.1f}s)\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
             if hit:
-                text += "\n*Chi tiết HIT:*\n"
+                text += "\nChi tiết HIT:\n"
                 for r in hit[:10]:
                     ban_text = "Không"
                     if r.get("banned") == "YES":
@@ -559,21 +569,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             ban_text += f" ({r['ban_start']} → {r['ban_end']})"
                         elif r.get("ban_start"):
                             ban_text += f" (từ {r['ban_start']})"
-                    text += (f"👤 `{r['username']}` - {r.get('name','?')}\n"
-                             f"   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n"
-                             f"   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)}\n"
-                             f"   Ban: {ban_text}\n")
+                    text += (
+                        f"👤 {r['username']} - {r.get('name','?')}\n"
+                        f"   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n"
+                        f"   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)}\n"
+                        f"   Ban: {ban_text}\n"
+                    )
             if miss:
-                text += "\n*MISS/ERROR:*\n"
-                for r in miss[:5]: text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
+                text += "\nMISS/ERROR:\n"
+                for r in miss[:5]: text += f"❌ {r['username']} - {r.get('message','?')}\n"
             if len(text) > 4000: text = text[:4000] + "\n... (cắt bớt)"
-            # Kết quả check sẽ kèm menu chính
             kb, _ = main_menu(uid)
             try:
-                await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                await wait_msg.edit_text(text, reply_markup=kb)
             except Exception as e:
                 log.error(f"Lỗi edit tin nhắn check: {e}")
-                await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                await context.bot.send_message(chat_id=uid, text=text, reply_markup=kb)
         finally:
             with processing_lock:
                 processing_users.discard(uid)
@@ -683,7 +694,7 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ {'👑 VIP' if is_vip else '🔑 Thường'} | {limit} acc/ngày\n"
         f"Check: {CHECK_LIMIT_VIP if is_vip else CHECK_LIMIT_NORMAL} acc/ngày\n"
         "⏳ Key tồn tại 24h, sau 24h sẽ tự mất.",
-        reply_markup=kb, parse_mode=ParseMode.MARKDOWN
+        reply_markup=kb
     )
 
 async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -765,7 +776,7 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(text, reply_markup=reply_markup)
         # Gửi menu chính riêng
         kb, menu_text = main_menu(uid)
-        await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
     finally:
         with processing_lock:
             processing_users.discard(uid)
@@ -783,7 +794,7 @@ async def genkey(update, context):
             keys[k] = {"type":"normal","created":datetime.now(TZ).strftime("%d/%m/%Y %H:%M"),"created_ts":time.time()}
             new.append(k)
     save_data()
-    await update.message.reply_text(f"🔑 Key thường ({LIMIT_NORMAL}/ngày) - 24h:\n" + "\n".join(f"`{k}`" for k in new), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🔑 Key thường ({LIMIT_NORMAL}/ngày) - 24h:\n" + "\n".join(k for k in new))
 
 async def genvip(update, context):
     if not is_admin(update.effective_user.id): return
@@ -797,32 +808,32 @@ async def genvip(update, context):
             keys[k] = {"type":"vip","vip":True,"created":datetime.now(TZ).strftime("%d/%m/%Y %H:%M"),"created_ts":time.time()}
             new.append(k)
     save_data()
-    await update.message.reply_text(f"👑 Key VIP ({LIMIT_VIP}/ngày) - 24h:\n" + "\n".join(f"`{k}`" for k in new), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"👑 Key VIP ({LIMIT_VIP}/ngày) - 24h:\n" + "\n".join(k for k in new))
 
 async def key_status(update, context):
     if not is_admin(update.effective_user.id): return
     with keys_lock:
         k_list = list(keys.items())[:15]
-        k_text = "\n".join(f"`{k}` ({'VIP' if v.get('vip') else 'TH'})" for k,v in k_list) if k_list else ""
+        k_text = "\n".join(f"{k} ({'VIP' if v.get('vip') else 'TH'})" for k,v in k_list) if k_list else ""
     with users_lock:
         u_list = list(users.items())[:20]
         u_text = ""
         for uid, u in u_list:
             if uid in ("admin", str(ADMIN_ID)): continue
             limit = LIMIT_VIP if u.get("vip") else LIMIT_NORMAL
-            u_text += f"👤 {u.get('name',uid)} | `{uid}` | {u.get('key','?')[:8]}... ({'VIP' if u.get('vip') else 'TH'}) | {u.get('daily_used',0)}/{limit}\n"
-    t = "📊 *Trạng thái*\n\n"
-    if k_text: t += "🔑 *Chưa dùng:*\n" + k_text
-    if u_text: t += "\n👥 *Đã dùng:*\n" + u_text
+            u_text += f"👤 {u.get('name',uid)} | {uid} | {u.get('key','?')[:8]}... ({'VIP' if u.get('vip') else 'TH'}) | {u.get('daily_used',0)}/{limit}\n"
+    t = "📊 Trạng thái\n\n"
+    if k_text: t += "🔑 Chưa dùng:\n" + k_text
+    if u_text: t += "\n👥 Đã dùng:\n" + u_text
     if not k_text and not u_text: t += "📭 Trống"
-    await update.message.reply_text(t, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(t)
 
 async def users_list(update, context):
     if not is_admin(update.effective_user.id): return
     with users_lock:
         if not users: await update.message.reply_text("📭 Trống"); return
-        u_list = [f"👤 {u.get('name',uid)} | `{uid}`" for uid,u in users.items() if uid not in ("admin",str(ADMIN_ID))][:30]
-    await update.message.reply_text("👥 *Users:*\n" + "\n".join(u_list), parse_mode=ParseMode.MARKDOWN)
+        u_list = [f"👤 {u.get('name',uid)} | {uid}" for uid,u in users.items() if uid not in ("admin",str(ADMIN_ID))][:30]
+    await update.message.reply_text("👥 Users:\n" + "\n".join(u_list))
 
 async def stats(update, context):
     if not is_admin(update.effective_user.id): return
@@ -842,8 +853,8 @@ async def listkeys(update, context):
     if not is_admin(update.effective_user.id): return
     with keys_lock:
         if not keys: await update.message.reply_text("📭 Trống"); return
-        k_list = [f"`{k}` ({'VIP' if v.get('vip') else 'TH'})" for k,v in list(keys.items())[:20]]
-    await update.message.reply_text("🔑 *Kho key:*\n" + "\n".join(k_list), parse_mode=ParseMode.MARKDOWN)
+        k_list = [f"{k} ({'VIP' if v.get('vip') else 'TH'})" for k,v in list(keys.items())[:20]]
+    await update.message.reply_text("🔑 Kho key:\n" + "\n".join(k_list))
 
 async def ban(update, context):
     if not is_admin(update.effective_user.id): return
@@ -923,9 +934,9 @@ async def muted_list(update, context):
                 with users_lock:
                     u = users.get(str(uid), {})
                     name = u.get("name", str(uid))
-                lines.append(f"👤 {name} | `{uid}` | ⏳{int(until-now)}s")
+                lines.append(f"👤 {name} | {uid} | ⏳{int(until-now)}s")
         t = "\n".join(lines[:20])
-    await update.message.reply_text(f"🤐 *Mute:*\n\n{t or '📭'}", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🤐 Mute:\n\n{t or '📭'}")
 
 async def unmute_cmd(update, context):
     if not is_admin(update.effective_user.id): return
