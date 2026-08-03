@@ -1,7 +1,7 @@
 import asyncio, os, time, logging, secrets, pytz, json, threading, requests
 from datetime import datetime
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
 from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,7 +35,8 @@ TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
-CHECK_WORKERS = 10  # số luồng check đồng thời
+CHECK_TIMEOUT = 15
+CHECK_CONCURRENT = 15
 OUTPUT_DIR = "lq_data"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -121,9 +122,10 @@ def fetch_fast(n):
         stop_flag.set()
     return live_accs[:n]
 
+# ===== CHECK ACC =====
 def check_acc_api(username, password):
     try:
-        r = requests.post(CHECK_API_URL, data={"user": username, "pass": password, "apikey": CHECK_API_KEY}, timeout=45)
+        r = requests.post(CHECK_API_URL, data={"user": username, "pass": password, "apikey": CHECK_API_KEY}, timeout=CHECK_TIMEOUT)
         d = r.json()
         if d.get("ok") and d["result"].get("status") == "HIT":
             info = d["result"]; skins = info.get("aov_skins", {})
@@ -136,7 +138,6 @@ def check_acc_api(username, password):
                 ban_status = "YES" if ban_info.get("status") == "banned" else "NO"
             else:
                 ban_status = ban_info
-
             return {
                 "status": "HIT",
                 "username": username,
@@ -158,13 +159,9 @@ def check_acc_api(username, password):
     except Exception as e:
         return {"status": "ERROR", "username": username, "message": str(e)}
 
-def check_acc_batch(acc_list):
-    results = []
-    with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as executor:
-        future_to_acc = {executor.submit(check_acc_api, u, p): (u, p) for acc_str in acc_list if "|" in acc_str for u, p in [acc_str.split("|", 1)]}
-        for future in as_completed(future_to_acc):
-            results.append(future.result())
-    return results
+async def check_acc_async(username, password):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, check_acc_api, username, password)
 
 def get_check_limit(uid):
     if uid == ADMIN_ID: return 99999
@@ -190,6 +187,7 @@ def update_check_count(uid, count):
 request_log = defaultdict(list)
 muted_users = {}
 processing_users = set()
+start_locks = {}  # uid -> asyncio.Lock
 
 def today_vn(): return datetime.now(TZ).strftime("%Y-%m-%d")
 def is_admin(uid): return uid == ADMIN_ID
@@ -252,13 +250,20 @@ def login_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid != ADMIN_ID and check_spam(uid): await update.message.reply_text("🚫 Spam! 60s."); return
-    user = update.effective_user; name = user.full_name or user.username or str(uid)
-    if str(uid) in users: users[str(uid)]["name"] = name; save_data()
-    if uid == ADMIN_ID: await update.message.reply_text(admin_menu_text(), parse_mode=ParseMode.MARKDOWN)
-    elif is_auth(uid):
-        kb, text = main_menu(uid); await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-    else: await update.message.reply_text("🤖 *LQ ACC BOT*\n\n🔐 Chưa có key.\n👉 Nhấn nút dưới.", reply_markup=login_menu(), parse_mode=ParseMode.MARKDOWN)
+    # Chặn spam start
+    if uid in start_locks:
+        return
+    lock = asyncio.Lock()
+    start_locks[uid] = lock
+    async with lock:
+        if uid != ADMIN_ID and check_spam(uid): await update.message.reply_text("🚫 Spam! 60s."); return
+        user = update.effective_user; name = user.full_name or user.username or str(uid)
+        if str(uid) in users: users[str(uid)]["name"] = name; save_data()
+        if uid == ADMIN_ID: await update.message.reply_text(admin_menu_text(), parse_mode=ParseMode.MARKDOWN)
+        elif is_auth(uid):
+            kb, text = main_menu(uid); await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        else: await update.message.reply_text("🤖 *LQ ACC BOT*\n\n🔐 Chưa có key.\n👉 Nhấn nút dưới.", reply_markup=login_menu(), parse_mode=ParseMode.MARKDOWN)
+    del start_locks[uid]
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -266,6 +271,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_auth(uid) and data not in ["key_input"]:
         await query.edit_message_text("🔐 Bạn chưa nhập key!", reply_markup=login_menu()); return
     if check_spam(uid): await query.edit_message_text("🚫 Spam!"); return
+
+    # Kiểm tra banned cho mọi chức năng (trừ key_input khi chưa auth)
+    if is_auth(uid):
+        u = get_user(uid)
+        if u.get("banned"):
+            await query.edit_message_text("🚫 Bạn đã bị khóa!"); return
 
     if data.startswith("lay_"):
         n = int(data.split("_")[1])
@@ -295,12 +306,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"🎉 {len(accs)} acc ({t1:.1f}s)\n\n{acc_text}"
         reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
         await query.edit_message_text(msg, reply_markup=reply_markup)
-        kb, text = main_menu(uid); await context.bot.send_message(chat_id=uid, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        # Không gửi menu riêng nữa, vì đã có nút check, người dùng có thể ấn /start nếu muốn menu mới
 
     elif data.startswith("checkacc_"):
         parts = data.split("_"); req_count = int(parts[1]) if len(parts) == 2 else 0
         if req_count <= 0: return
-        uid = query.from_user.id; u = get_user(uid)
+        u = get_user(uid)
         acc_list = u.get("last_acc", [])
         if not acc_list:
             await query.edit_message_text("⚠️ Vui lòng lấy acc trước để sử dụng tính năng check.\n\nBạn cần lấy acc từ bot, sau đó nhấn nút Check ở danh sách acc vừa lấy.")
@@ -310,16 +321,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if can_check <= 0:
             await query.edit_message_text("🚫 Bạn đã hết lượt check hôm nay hoặc không có acc để check.")
             return
-        await query.edit_message_text(f"🔍 Đang check {can_check} acc, vui lòng đợi...")
+        wait_msg = await query.edit_message_text(f"🔍 Đang check {can_check} acc...")
+        t0 = time.time()
         accs_to_check = acc_list[:can_check]
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, check_acc_batch, accs_to_check)
-        # Chỉ tính kết quả HIT/MISS là thành công
+        sem = asyncio.Semaphore(CHECK_CONCURRENT)
+        async def limited_check(acc_str):
+            if "|" not in acc_str:
+                return {"status": "ERROR", "username": acc_str, "message": "Sai định dạng"}
+            u_name, pwd = acc_str.split("|", 1)
+            async with sem:
+                return await check_acc_async(u_name, pwd)
+        tasks = [limited_check(acc) for acc in accs_to_check]
+        results = await asyncio.gather(*tasks)
+        t1 = time.time() - t0
         success_results = [r for r in results if r["status"] in ("HIT", "MISS")]
         if success_results: update_check_count(uid, len(success_results))
         hit = [r for r in results if r["status"] == "HIT"]
         miss = [r for r in results if r["status"] != "HIT"]
-        text = f"📊 *Kết quả check {len(results)} acc*\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
+        text = f"📊 *Kết quả check {len(results)} acc ({t1:.1f}s)*\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
         if hit:
             text += "\n*Chi tiết HIT:*\n"
             for r in hit[:10]:
@@ -340,15 +359,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "\n*MISS/ERROR:*\n"
             for r in miss[:5]: text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
         kb, _ = main_menu(uid)
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
     elif data == "export":
-        u = get_user(uid); history = u.get("history",[])
+        u = get_user(uid)
+        history = u.get("history",[])
         if not history: await query.edit_message_text("📭 Chưa lấy acc nào."); return
         ts = int(time.time()); fn = f"{OUTPUT_DIR}/history_{uid}_{ts}.txt"
         with open(fn, "w", encoding="utf-8") as f: f.write("\n".join(history))
         with open(fn, "rb") as f: await context.bot.send_document(chat_id=uid, document=f, filename=f"lich_su_acc_{ts}.txt", caption=f"📁 {len(history)} acc")
-        kb, text = main_menu(uid); await context.bot.send_message(chat_id=uid, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        # Gửi menu mới
+        kb, text = main_menu(uid)
+        await context.bot.send_message(chat_id=uid, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         await query.edit_message_text("✅ Đã gửi file!")
 
     elif data == "profile":
@@ -358,8 +380,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"👤 {vip}\n📊 Lấy: {u.get('daily_used',0)}/{limit}\n📦 Tổng: {u.get('used',0)}\n🔍 Check: {check_rem} lượt\n📋 Lịch sử: {len(u.get('history',[]))} acc")
 
     elif data == "key_input":
-        if is_auth(uid): await query.answer("Bạn đã có key rồi!", show_alert=True)
-        else: await query.edit_message_text("📝 Gửi key của bạn: /key <mã>")
+        if is_auth(uid):
+            await query.answer("Bạn đã có key rồi!", show_alert=True)
+        else:
+            await query.edit_message_text("📝 Gửi key của bạn: /key <mã>")
 
 async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
@@ -412,6 +436,7 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
     await msg.edit_text(text, reply_markup=reply_markup)
 
+# Admin handlers giữ nguyên
 async def genkey(update, context):
     if not is_admin(update.effective_user.id): return
     n = int(context.args[0]) if context.args and context.args[0].isdigit() else 1
