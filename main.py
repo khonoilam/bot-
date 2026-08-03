@@ -40,8 +40,8 @@ TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
-CHECK_TIMEOUT = 15                # tăng timeout
-CHECK_CONCURRENT = 50             # giảm concurrent để ổn định
+CHECK_TIMEOUT = 15
+CHECK_CONCURRENT = 50
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -441,6 +441,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = msg[:4000] + "\n... (cắt bớt)"
             reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
             await query.edit_message_text(msg, reply_markup=reply_markup)
+            # Gửi menu chính riêng
+            kb, menu_text = main_menu(uid)
+            await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         finally:
             with processing_lock:
                 processing_users.discard(uid)
@@ -455,6 +458,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             processing_users.add(uid)
         try:
+            # Lưu original message để cập nhật sau
+            original_msg = query.message
             with users_lock:
                 u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"last_acc":[]})
                 acc_list = list(u.get("last_acc", []))
@@ -472,11 +477,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 accs_to_check = acc_list[:can_check]
 
-            # Gửi tin nhắn chờ
-            wait_msg = await query.edit_message_text(f"🔍 Đang check {can_check} acc...")
+            # Gửi tin nhắn chờ mới (KHÔNG sửa original_msg)
+            wait_msg = await context.bot.send_message(chat_id=uid, text=f"🔍 Đang check {can_check} acc...")
             t0 = time.time()
 
-            # Chuẩn bị semaphore và session aiohttp
+            # Thực hiện check
             sem = asyncio.Semaphore(CHECK_CONCURRENT)
             async with aiohttp.ClientSession() as session:
                 async def limited_check(acc_str):
@@ -488,12 +493,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 tasks = [limited_check(acc) for acc in accs_to_check]
                 results = await asyncio.gather(*tasks)
-
             t1 = time.time() - t0
 
             success_results = [r for r in results if r["status"] in ("HIT", "MISS")]
             hit_acc_strs = [accs_to_check[i] for i, r in enumerate(results) if r["status"] == "HIT"]
 
+            # Cập nhật dữ liệu
             with users_lock:
                 u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"history":[],"last_acc":[],"checked_acc":[],"last_check_date":"","checked_today":0})
                 if success_results:
@@ -510,12 +515,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     u["checked_acc"] = checked
                 # Xóa acc đã check khỏi last_acc
                 if len(acc_list) > can_check:
-                    u["last_acc"] = acc_list[can_check:]
+                    new_last = acc_list[can_check:]
                 else:
-                    u["last_acc"] = []
+                    new_last = []
+                u["last_acc"] = new_last
             if uid != ADMIN_ID:
                 save_data()
 
+            # Cập nhật original message với danh sách acc mới và nút check mới
+            with users_lock:
+                u2 = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
+                new_total = len(new_last)
+                today = today_vn()
+                if u2.get("last_check_date") != today:
+                    check_rem = CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL
+                else:
+                    check_rem = max(0, (CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL) - u2.get("checked_today", 0))
+            new_check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
+                                 for x in [5,10,15,20,25] if x <= check_rem and x <= new_total]
+            new_acc_text = "\n".join(new_last[:20])
+            if new_total > 20:
+                new_acc_text += f"\n... và {new_total-20} acc khác"
+            new_msg_text = f"🎉 Còn {new_total} acc chưa check\n\n{new_acc_text}"
+            if len(new_msg_text) > 4000:
+                new_msg_text = new_msg_text[:4000] + "\n... (cắt bớt)"
+            new_reply_markup = InlineKeyboardMarkup([new_check_buttons[i:i+3] for i in range(0, len(new_check_buttons), 3)]) if new_check_buttons else None
+            try:
+                await original_msg.edit_text(new_msg_text, reply_markup=new_reply_markup)
+            except Exception as e:
+                log.error(f"Không thể cập nhật tin nhắn gốc: {e}")
+
+            # Soạn kết quả check
             hit = [r for r in results if r["status"] == "HIT"]
             miss = [r for r in results if r["status"] != "HIT"]
             text = f"📊 *Kết quả check {len(results)} acc ({t1:.1f}s)*\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
@@ -537,6 +567,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += "\n*MISS/ERROR:*\n"
                 for r in miss[:5]: text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
             if len(text) > 4000: text = text[:4000] + "\n... (cắt bớt)"
+            # Kết quả check sẽ kèm menu chính
             kb, _ = main_menu(uid)
             try:
                 await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -732,6 +763,9 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"🎉 {len(accs)} acc\n\n{acc_text}"
         reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
         await msg.edit_text(text, reply_markup=reply_markup)
+        # Gửi menu chính riêng
+        kb, menu_text = main_menu(uid)
+        await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     finally:
         with processing_lock:
             processing_users.discard(uid)
