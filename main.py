@@ -8,16 +8,20 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
+# ======================== FLASK KEEP-ALIVE ========================
 app = Flask(__name__)
 @app.route("/")
-def home(): return "Bot đang chạy!"
-def web(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+def home():
+    return "Bot đang chạy!"
+def web():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 Thread(target=web, daemon=True).start()
 
+# ======================== CONFIG ========================
 BOT_TOKEN = "8258187122:AAExWr8i1jAeqZJbxnWkLW39gGA_FQN3I1I"
 ADMIN_ID = 8721023843
 TANGACC_TOKEN = "https://tangacc.net/token.php"
-TANGACC_ACC = "https://tangacc.net/get_lq_acc.php"
+TANGACC_ACC   = "https://tangacc.net/get_lq_acc.php"
 THREADS = 70
 TIMEOUT = 10
 CHECK_API_URL = "http://160.22.107.245:5000/check"
@@ -43,6 +47,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger(__name__)
 
+# ======================== GLOBAL DATA ========================
 keys = {}
 users = {}
 used_accounts = set()
@@ -52,16 +57,21 @@ HEADERS = {
     "referer": "https://tangacc.net/", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
+# ======================== JSONBIN SYNC ========================
 def clean_expired_keys():
     now = time.time()
     expired = [k for k, v in keys.items() if now - v.get("created_ts", 0) > KEY_EXPIRE_SECONDS]
-    for k in expired: del keys[k]
-    if expired: log.info(f"Đã xóa {len(expired)} key hết hạn"); save_data()
+    for k in expired:
+        del keys[k]
+    if expired:
+        log.info(f"Đã xóa {len(expired)} key hết hạn")
+        save_data()
 
 def load_data():
     global keys, users, used_accounts
     try:
-        r = requests.get(f"{JSONBIN_API_URL}/{JSONBIN_BIN_ID}/latest", headers={"X-Master-Key": JSONBIN_API_KEY}, timeout=10)
+        r = requests.get(f"{JSONBIN_API_URL}/{JSONBIN_BIN_ID}/latest",
+                         headers={"X-Master-Key": JSONBIN_API_KEY}, timeout=10)
         if r.status_code == 200:
             data = r.json().get("record", {})
             keys = data.get("keys", {})
@@ -70,7 +80,8 @@ def load_data():
             clean_expired_keys()
             log.info(f"Đã tải bin: {len(keys)} keys, {len(users)} users")
             return
-    except Exception as e: log.error(f"Lỗi tải bin: {e}")
+    except Exception as e:
+        log.error(f"Lỗi tải bin: {e}")
     keys, users, used_accounts = {}, {}, set()
 
 def save_data():
@@ -79,10 +90,13 @@ def save_data():
             data = {"keys": keys, "users": users, "used_accounts": list(used_accounts)}
             r = requests.put(f"{JSONBIN_API_URL}/{JSONBIN_BIN_ID}", json=data,
                              headers={"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}, timeout=10)
-            if r.status_code == 200: return
-        except: pass
+            if r.status_code == 200:
+                return
+        except:
+            pass
         time.sleep(1)
 
+# ======================== TANGACC ENGINE ========================
 def get_acc(session):
     try:
         r = session.get(TANGACC_TOKEN, headers=HEADERS, timeout=TIMEOUT)
@@ -91,8 +105,10 @@ def get_acc(session):
         h = {**HEADERS, "content-type": "application/x-www-form-urlencoded", "origin": "https://tangacc.net"}
         r2 = session.post(TANGACC_ACC, headers=h, data={"token": token}, timeout=TIMEOUT)
         acc = r2.text.strip()
-        if acc and not acc.startswith("WAIT") and "|" in acc: return acc
-    except: pass
+        if acc and not acc.startswith("WAIT") and "|" in acc:
+            return acc
+    except:
+        pass
     return None
 
 def fetch_fast(n):
@@ -118,17 +134,21 @@ def fetch_fast(n):
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
         for _ in range(THREADS): ex.submit(worker)
         deadline = time.time() + 45
-        while len(live_accs) < n and time.time() < deadline: time.sleep(0.3)
+        while len(live_accs) < n and time.time() < deadline:
+            time.sleep(0.3)
         stop_flag.set()
     return live_accs[:n]
 
-# ===== CHECK ACC =====
+# ======================== CHECK ACC ========================
 def check_acc_api(username, password):
     try:
-        r = requests.post(CHECK_API_URL, data={"user": username, "pass": password, "apikey": CHECK_API_KEY}, timeout=CHECK_TIMEOUT)
+        r = requests.post(CHECK_API_URL,
+                          data={"user": username, "pass": password, "apikey": CHECK_API_KEY},
+                          timeout=CHECK_TIMEOUT)
         d = r.json()
         if d.get("ok") and d["result"].get("status") == "HIT":
-            info = d["result"]; skins = info.get("aov_skins", {})
+            info = d["result"]
+            skins = info.get("aov_skins", {})
             ban_info = info.get("aov_banned", "NO")
             ban_start = info.get("ban_start", "")
             ban_end = info.get("ban_end", "")
@@ -155,7 +175,8 @@ def check_acc_api(username, password):
                 "email_verified": info.get("email_verified"),
             }
         else:
-            return {"status": "MISS", "username": username, "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
+            return {"status": "MISS", "username": username,
+                    "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
     except Exception as e:
         return {"status": "ERROR", "username": username, "message": str(e)}
 
@@ -171,7 +192,8 @@ def get_remaining_checks(uid):
     if uid == ADMIN_ID: return 99999
     today = datetime.now(TZ).strftime("%Y-%m-%d")
     user = users.get(str(uid), {})
-    if user.get("last_check_date") != today: return get_check_limit(uid)
+    if user.get("last_check_date") != today:
+        return get_check_limit(uid)
     return max(0, get_check_limit(uid) - user.get("checked_today", 0))
 
 def update_check_count(uid, count):
@@ -180,22 +202,33 @@ def update_check_count(uid, count):
     today = datetime.now(TZ).strftime("%Y-%m-%d")
     user = users[uid]
     if user.get("last_check_date") != today:
-        user["last_check_date"] = today; user["checked_today"] = count
-    else: user["checked_today"] = user.get("checked_today", 0) + count
+        user["last_check_date"] = today
+        user["checked_today"] = count
+    else:
+        user["checked_today"] = user.get("checked_today", 0) + count
     save_data()
 
+# ======================== UTILS ========================
 request_log = defaultdict(list)
 muted_users = {}
 processing_users = set()
-start_locks = {}  # uid -> asyncio.Lock
+start_locks = {}
 
-def today_vn(): return datetime.now(TZ).strftime("%Y-%m-%d")
-def is_admin(uid): return uid == ADMIN_ID
-def is_auth(uid): return uid == ADMIN_ID or (str(uid) in users and users[str(uid)].get("key") is not None)
-def get_limit(uid): return 99999 if uid == ADMIN_ID else (LIMIT_VIP if users.get(str(uid), {}).get("vip") else LIMIT_NORMAL)
+def today_vn():
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+def is_admin(uid):
+    return uid == ADMIN_ID
+def is_auth(uid):
+    if uid == ADMIN_ID: return True
+    return str(uid) in users and users[str(uid)].get("key") is not None
+def get_limit(uid):
+    if uid == ADMIN_ID: return 99999
+    return LIMIT_VIP if users.get(str(uid), {}).get("vip") else LIMIT_NORMAL
 def get_user(uid):
     if uid == ADMIN_ID:
-        if "admin" not in users: users["admin"] = {"history":[],"used":0,"daily_used":0,"banned":False,"vip":True,"last_acc":[]}
+        if "admin" not in users:
+            users["admin"] = {"history": [], "used": 0, "daily_used": 0,
+                              "banned": False, "vip": True, "last_acc": []}
         return users["admin"]
     return users.get(str(uid), {})
 
@@ -213,16 +246,23 @@ def check_spam(uid):
     return False
 
 def main_menu(uid):
-    u = get_user(uid); limit = get_limit(uid); used = u.get("daily_used", 0)
+    u = get_user(uid)
+    limit = get_limit(uid)
+    used = u.get("daily_used", 0)
     remaining = limit - used
     vip = "👑 VIP" if u.get("vip") else "🔑 Thường"
     check_rem = get_remaining_checks(uid)
     keyboard = [
-        [InlineKeyboardButton("🎮 Lấy 10 Acc", callback_data="lay_10"), InlineKeyboardButton("🎮 Lấy 30 Acc", callback_data="lay_30")],
+        [InlineKeyboardButton("🎮 Lấy 10 Acc", callback_data="lay_10"),
+         InlineKeyboardButton("🎮 Lấy 30 Acc", callback_data="lay_30")],
         [InlineKeyboardButton("🎮 Lấy 50 Acc", callback_data="lay_50")],
-        [InlineKeyboardButton("📁 Xuất File", callback_data="export"), InlineKeyboardButton("👤 Profile", callback_data="profile")],
+        [InlineKeyboardButton("📁 Xuất File", callback_data="export"),
+         InlineKeyboardButton("👤 Profile", callback_data="profile")],
     ]
-    text = f"🤖 *LQ ACC BOT*\n{vip}\n📊 Hôm nay: {used}/{limit} (Còn {remaining})\n🔍 Check: {check_rem} lượt\n⚡TangAcc\nChọn chức năng:"
+    text = (f"🤖 *LQ ACC BOT*\n{vip}\n"
+            f"📊 Hôm nay: {used}/{limit} (Còn {remaining})\n"
+            f"🔍 Check: {check_rem} lượt\n"
+            "⚡TangAcc\nChọn chức năng:")
     return InlineKeyboardMarkup(keyboard), text
 
 def admin_menu_text():
@@ -248,73 +288,115 @@ def login_menu():
         [InlineKeyboardButton("🔗 Lấy Key Free", url="https://t.me/chantuiii")],
     ])
 
+# ======================== HANDLERS ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    # Chặn spam start
+    # Tránh spam start gửi nhiều menu
     if uid in start_locks:
         return
     lock = asyncio.Lock()
     start_locks[uid] = lock
     async with lock:
-        if uid != ADMIN_ID and check_spam(uid): await update.message.reply_text("🚫 Spam! 60s."); return
-        user = update.effective_user; name = user.full_name or user.username or str(uid)
-        if str(uid) in users: users[str(uid)]["name"] = name; save_data()
-        if uid == ADMIN_ID: await update.message.reply_text(admin_menu_text(), parse_mode=ParseMode.MARKDOWN)
+        if uid != ADMIN_ID and check_spam(uid):
+            await update.message.reply_text("🚫 Spam! 60s.")
+            return
+        user = update.effective_user
+        name = user.full_name or user.username or str(uid)
+        if str(uid) in users:
+            users[str(uid)]["name"] = name
+            save_data()
+        if uid == ADMIN_ID:
+            await update.message.reply_text(admin_menu_text(), parse_mode=ParseMode.MARKDOWN)
         elif is_auth(uid):
-            kb, text = main_menu(uid); await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        else: await update.message.reply_text("🤖 *LQ ACC BOT*\n\n🔐 Chưa có key.\n👉 Nhấn nút dưới.", reply_markup=login_menu(), parse_mode=ParseMode.MARKDOWN)
-    del start_locks[uid]
+            kb, text = main_menu(uid)
+            await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(
+                "🤖 *LQ ACC BOT*\n\n🔐 Chưa có key.\n👉 Nhấn nút dưới.",
+                reply_markup=login_menu(), parse_mode=ParseMode.MARKDOWN
+            )
+    if uid in start_locks:
+        del start_locks[uid]
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    uid = query.from_user.id; data = query.data
-    if not is_auth(uid) and data not in ["key_input"]:
-        await query.edit_message_text("🔐 Bạn chưa nhập key!", reply_markup=login_menu()); return
-    if check_spam(uid): await query.edit_message_text("🚫 Spam!"); return
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    data = query.data
 
-    # Kiểm tra banned cho mọi chức năng (trừ key_input khi chưa auth)
+    # Nếu chưa auth và không phải key_input => đòi key
+    if not is_auth(uid) and data != "key_input":
+        await query.edit_message_text("🔐 Bạn chưa nhập key!", reply_markup=login_menu())
+        return
+
+    # Kiểm tra spam
+    if check_spam(uid):
+        await query.edit_message_text("🚫 Spam!")
+        return
+
+    # Kiểm tra banned (chỉ khi đã auth, vì nếu chưa auth thì chưa có user)
     if is_auth(uid):
         u = get_user(uid)
         if u.get("banned"):
-            await query.edit_message_text("🚫 Bạn đã bị khóa!"); return
+            await query.edit_message_text("🚫 Bạn đã bị khóa!")
+            return
 
+    # ---- Lấy acc ----
     if data.startswith("lay_"):
         n = int(data.split("_")[1])
-        u = get_user(uid); limit = get_limit(uid)
-        if u.get("banned"): await query.edit_message_text("🚫 Đã bị khóa!"); return
-        if u.get("date") != today_vn(): u["date"] = today_vn(); u["daily_used"] = 0
+        u = get_user(uid)
+        limit = get_limit(uid)
+        if u.get("date") != today_vn():
+            u["date"] = today_vn()
+            u["daily_used"] = 0
         if uid != ADMIN_ID:
             remaining = limit - u.get("daily_used", 0)
-            if remaining <= 0: await query.edit_message_text(f"🚫 Hết {limit} acc/ngày"); return
-            if n > remaining: n = remaining
-        if n > MAX_PER_REQ: n = MAX_PER_REQ
-        if uid in processing_users: await query.edit_message_text("⏳ Đợi..."); return
-        processing_users.add(uid); await query.edit_message_text(f"⏳ Đang lấy {n} acc...")
+            if remaining <= 0:
+                await query.edit_message_text(f"🚫 Hết {limit} acc/ngày")
+                return
+            if n > remaining:
+                n = remaining
+        if n > MAX_PER_REQ:
+            n = MAX_PER_REQ
+        if uid in processing_users:
+            await query.edit_message_text("⏳ Đợi...")
+            return
+        processing_users.add(uid)
+        await query.edit_message_text(f"⏳ Đang lấy {n} acc...")
         t0 = time.time()
-        loop = asyncio.get_event_loop(); accs = await loop.run_in_executor(None, fetch_fast, n)
+        loop = asyncio.get_event_loop()
+        accs = await loop.run_in_executor(None, fetch_fast, n)
         t1 = time.time() - t0
         processing_users.discard(uid)
-        if not accs: await query.edit_message_text("❌ Không lấy được acc."); return
-        u["history"] = u.get("history",[]) + accs; u["used"] = u.get("used",0) + len(accs)
-        u["daily_used"] = u.get("daily_used",0) + len(accs)
+        if not accs:
+            await query.edit_message_text("❌ Không lấy được acc.")
+            return
+        u["history"] = u.get("history", []) + accs
+        u["used"] = u.get("used", 0) + len(accs)
+        u["daily_used"] = u.get("daily_used", 0) + len(accs)
         u["last_acc"] = accs.copy()
-        if uid != ADMIN_ID: save_data()
+        if uid != ADMIN_ID:
+            save_data()
         check_rem = get_remaining_checks(uid)
-        check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}") for x in [5,10,15,20,25] if x <= check_rem and x <= len(accs)]
+        check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
+                         for x in [5,10,15,20,25] if x <= check_rem and x <= len(accs)]
         acc_text = "\n".join(accs[:20])
-        if len(accs) > 20: acc_text += f"\n... và {len(accs)-20} acc khác"
+        if len(accs) > 20:
+            acc_text += f"\n... và {len(accs)-20} acc khác"
         msg = f"🎉 {len(accs)} acc ({t1:.1f}s)\n\n{acc_text}"
         reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
         await query.edit_message_text(msg, reply_markup=reply_markup)
-        # Không gửi menu riêng nữa, vì đã có nút check, người dùng có thể ấn /start nếu muốn menu mới
 
+    # ---- Check acc ----
     elif data.startswith("checkacc_"):
-        parts = data.split("_"); req_count = int(parts[1]) if len(parts) == 2 else 0
-        if req_count <= 0: return
+        parts = data.split("_")
+        if len(parts) != 2:
+            return
+        req_count = int(parts[1])
         u = get_user(uid)
         acc_list = u.get("last_acc", [])
         if not acc_list:
-            await query.edit_message_text("⚠️ Vui lòng lấy acc trước để sử dụng tính năng check.\n\nBạn cần lấy acc từ bot, sau đó nhấn nút Check ở danh sách acc vừa lấy.")
+            await query.edit_message_text("⚠️ Vui lòng lấy acc trước để sử dụng tính năng check.")
             return
         remaining = get_remaining_checks(uid)
         can_check = min(req_count, len(acc_list), remaining)
@@ -328,14 +410,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def limited_check(acc_str):
             if "|" not in acc_str:
                 return {"status": "ERROR", "username": acc_str, "message": "Sai định dạng"}
-            u_name, pwd = acc_str.split("|", 1)
+            uname, pwd = acc_str.split("|", 1)
             async with sem:
-                return await check_acc_async(u_name, pwd)
+                return await check_acc_async(uname, pwd)
         tasks = [limited_check(acc) for acc in accs_to_check]
         results = await asyncio.gather(*tasks)
         t1 = time.time() - t0
+        # Đếm kết quả thành công (HIT hoặc MISS) để trừ lượt
         success_results = [r for r in results if r["status"] in ("HIT", "MISS")]
-        if success_results: update_check_count(uid, len(success_results))
+        if success_results:
+            update_check_count(uid, len(success_results))
         hit = [r for r in results if r["status"] == "HIT"]
         miss = [r for r in results if r["status"] != "HIT"]
         text = f"📊 *Kết quả check {len(results)} acc ({t1:.1f}s)*\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
@@ -349,36 +433,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ban_text += f" ({r['ban_start']} → {r['ban_end']})"
                     elif r.get("ban_start"):
                         ban_text += f" (từ {r['ban_start']})"
-                text += (
-                    f"👤 `{r['username']}` - {r.get('name','?')}\n"
-                    f"   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n"
-                    f"   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)}\n"
-                    f"   Ban: {ban_text}\n"
-                )
+                text += (f"👤 `{r['username']}` - {r.get('name','?')}\n"
+                         f"   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n"
+                         f"   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)}\n"
+                         f"   Ban: {ban_text}\n")
         if miss:
             text += "\n*MISS/ERROR:*\n"
-            for r in miss[:5]: text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
+            for r in miss[:5]:
+                text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
         kb, _ = main_menu(uid)
         await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
+    # ---- Xuất file ----
     elif data == "export":
         u = get_user(uid)
-        history = u.get("history",[])
-        if not history: await query.edit_message_text("📭 Chưa lấy acc nào."); return
-        ts = int(time.time()); fn = f"{OUTPUT_DIR}/history_{uid}_{ts}.txt"
-        with open(fn, "w", encoding="utf-8") as f: f.write("\n".join(history))
-        with open(fn, "rb") as f: await context.bot.send_document(chat_id=uid, document=f, filename=f"lich_su_acc_{ts}.txt", caption=f"📁 {len(history)} acc")
-        # Gửi menu mới
+        history = u.get("history", [])
+        if not history:
+            await query.edit_message_text("📭 Chưa lấy acc nào.")
+            return
+        ts = int(time.time())
+        fn = f"{OUTPUT_DIR}/history_{uid}_{ts}.txt"
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write("\n".join(history))
+        with open(fn, "rb") as f:
+            await context.bot.send_document(chat_id=uid, document=f,
+                                            filename=f"lich_su_acc_{ts}.txt",
+                                            caption=f"📁 {len(history)} acc")
+        # Gửi menu mới sau khi xuất file
         kb, text = main_menu(uid)
         await context.bot.send_message(chat_id=uid, text=text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         await query.edit_message_text("✅ Đã gửi file!")
 
+    # ---- Profile ----
     elif data == "profile":
-        u = get_user(uid); limit = get_limit(uid)
+        u = get_user(uid)
+        limit = get_limit(uid)
         vip = "👑 Admin" if uid == ADMIN_ID else ("👑 VIP" if u.get("vip") else "🔑 Thường")
         check_rem = get_remaining_checks(uid)
-        await query.edit_message_text(f"👤 {vip}\n📊 Lấy: {u.get('daily_used',0)}/{limit}\n📦 Tổng: {u.get('used',0)}\n🔍 Check: {check_rem} lượt\n📋 Lịch sử: {len(u.get('history',[]))} acc")
+        await query.edit_message_text(
+            f"👤 {vip}\n📊 Lấy: {u.get('daily_used',0)}/{limit}\n"
+            f"📦 Tổng: {u.get('used',0)}\n🔍 Check: {check_rem} lượt\n"
+            f"📋 Lịch sử: {len(u.get('history',[]))} acc"
+        )
 
+    # ---- Nhập key ----
     elif data == "key_input":
         if is_auth(uid):
             await query.answer("Bạn đã có key rồi!", show_alert=True)
@@ -387,56 +485,90 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if not context.args: await update.message.reply_text("🔐 Key không đúng!"); return
+    if not context.args:
+        await update.message.reply_text("🔐 Key không đúng!")
+        return
     key = context.args[0].strip().upper()
     if key not in keys:
         await update.message.reply_text("🔐 Key không đúng hoặc đã hết hạn (key chỉ tồn tại 24h).")
         return
     kd = keys[key]
-    if kd.get("banned"): await update.message.reply_text("❌ Key bị khóa"); return
+    if kd.get("banned"):
+        await update.message.reply_text("❌ Key bị khóa")
+        return
     if time.time() - kd.get("created_ts", 0) > KEY_EXPIRE_SECONDS:
-        del keys[key]; save_data()
+        del keys[key]
+        save_data()
         await update.message.reply_text("❌ Key đã hết hạn (24h). Vui lòng lấy key mới.")
         return
     is_vip = kd.get("vip", False)
-    users[uid] = {"key":key,"vip":is_vip,"used":0,"daily_used":0,"date":today_vn(),"banned":False,"history":[],
-                  "last_check_date":today_vn(),"checked_today":0,"name":update.effective_user.full_name or uid,"last_acc":[]}
-    del keys[key]; save_data()
+    users[uid] = {
+        "key": key, "vip": is_vip, "used": 0, "daily_used": 0,
+        "date": today_vn(), "banned": False, "history": [],
+        "last_check_date": today_vn(), "checked_today": 0,
+        "name": update.effective_user.full_name or uid, "last_acc": []
+    }
+    del keys[key]
+    save_data()
     limit = LIMIT_VIP if is_vip else LIMIT_NORMAL
     kb, text = main_menu(int(uid))
     await update.message.reply_text(
-        f"✅ {'👑 VIP' if is_vip else '🔑 Thường'} | {limit} acc/ngày\nCheck: {CHECK_LIMIT_VIP if is_vip else CHECK_LIMIT_NORMAL} acc/ngày\n⏳ Key tồn tại 24h, sau 24h sẽ tự mất.",
-        reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        f"✅ {'👑 VIP' if is_vip else '🔑 Thường'} | {limit} acc/ngày\n"
+        f"Check: {CHECK_LIMIT_VIP if is_vip else CHECK_LIMIT_NORMAL} acc/ngày\n"
+        "⏳ Key tồn tại 24h, sau 24h sẽ tự mất.",
+        reply_markup=kb, parse_mode=ParseMode.MARKDOWN
+    )
 
 async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_auth(uid): await update.message.reply_text("🔐 Chưa nhập key."); return
-    if check_spam(uid): await update.message.reply_text("🚫 Spam!"); return
+    if not is_auth(uid):
+        await update.message.reply_text("🔐 Chưa nhập key.")
+        return
+    if check_spam(uid):
+        await update.message.reply_text("🚫 Spam!")
+        return
     u = get_user(uid)
-    if u.get("banned"): await update.message.reply_text("🚫 Bị khóa"); return
+    if u.get("banned"):
+        await update.message.reply_text("🚫 Bị khóa")
+        return
     limit = get_limit(uid)
-    if u.get("date") != today_vn(): u["date"] = today_vn(); u["daily_used"] = 0
-    try: n = int(context.args[0]) if context.args else 10
-    except: n = 10
+    if u.get("date") != today_vn():
+        u["date"] = today_vn()
+        u["daily_used"] = 0
+    try:
+        n = int(context.args[0]) if context.args else 10
+    except:
+        n = 10
     if uid != ADMIN_ID:
         remaining = limit - u.get("daily_used", 0)
-        if n > remaining: await update.message.reply_text(f"⚠️ Còn {remaining} acc"); return
-    processing_users.add(uid); msg = await update.message.reply_text(f"⏳ {n} acc...")
-    loop = asyncio.get_event_loop(); accs = await loop.run_in_executor(None, fetch_fast, n)
+        if n > remaining:
+            await update.message.reply_text(f"⚠️ Còn {remaining} acc")
+            return
+    processing_users.add(uid)
+    msg = await update.message.reply_text(f"⏳ {n} acc...")
+    loop = asyncio.get_event_loop()
+    accs = await loop.run_in_executor(None, fetch_fast, n)
     processing_users.discard(uid)
-    if not accs: await msg.edit_text("Không lấy được"); return
-    u["history"] = u.get("history",[]) + accs; u["used"] = u.get("used",0) + len(accs)
-    u["daily_used"] = u.get("daily_used",0) + len(accs); u["last_acc"] = accs.copy()
-    if uid != ADMIN_ID: save_data()
+    if not accs:
+        await msg.edit_text("Không lấy được")
+        return
+    u["history"] = u.get("history", []) + accs
+    u["used"] = u.get("used", 0) + len(accs)
+    u["daily_used"] = u.get("daily_used", 0) + len(accs)
+    u["last_acc"] = accs.copy()
+    if uid != ADMIN_ID:
+        save_data()
     check_rem = get_remaining_checks(uid)
-    check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}") for x in [5,10,15,20,25] if x <= check_rem and x <= len(accs)]
+    check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
+                     for x in [5,10,15,20,25] if x <= check_rem and x <= len(accs)]
     acc_text = "\n".join(accs[:20])
-    if len(accs) > 20: acc_text += f"\n... và {len(accs)-20} acc khác"
+    if len(accs) > 20:
+        acc_text += f"\n... và {len(accs)-20} acc khác"
     text = f"🎉 {len(accs)} acc\n\n{acc_text}"
     reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
     await msg.edit_text(text, reply_markup=reply_markup)
 
-# Admin handlers giữ nguyên
+# ======================== ADMIN HANDLERS ========================
 async def genkey(update, context):
     if not is_admin(update.effective_user.id): return
     n = int(context.args[0]) if context.args and context.args[0].isdigit() else 1
@@ -545,14 +677,19 @@ async def resetall(update, context):
 
 async def error_handler(update, context): log.exception(context.error)
 
+# ======================== MAIN ========================
 if __name__ == "__main__":
     log.info(f"🤖 LQ ACC BOT | Admin:{ADMIN_ID}")
     load_data()
     application = Application.builder().token(BOT_TOKEN).build()
-    for cmd, h in [("start",start),("key",key_cmd),("lay",lay),
-                   ("genkey",genkey),("genvip",genvip),("status",key_status),("users",users_list),
-                   ("stats",stats),("keys",listkeys),("ban",ban),("unban",unban),("revoke",revoke),
-                   ("reset",reset),("delkey",delkey),("muted",muted_list),("unmute",unmute_cmd),("resetall",resetall)]:
+    handlers = [
+        ("start", start), ("key", key_cmd), ("lay", lay),
+        ("genkey", genkey), ("genvip", genvip), ("status", key_status), ("users", users_list),
+        ("stats", stats), ("keys", listkeys), ("ban", ban), ("unban", unban), ("revoke", revoke),
+        ("reset", reset), ("delkey", delkey), ("muted", muted_list), ("unmute", unmute_cmd),
+        ("resetall", resetall)
+    ]
+    for cmd, h in handlers:
         application.add_handler(CommandHandler(cmd, h))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_error_handler(error_handler)
