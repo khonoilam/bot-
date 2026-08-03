@@ -1,4 +1,4 @@
-import asyncio, os, time, logging, secrets, pytz, json, threading, requests, copy
+import asyncio, aiohttp, os, time, logging, secrets, pytz, json, threading, requests, copy
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -40,8 +40,8 @@ TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
-CHECK_TIMEOUT = 8
-CHECK_CONCURRENT = 100
+CHECK_TIMEOUT = 15                # tăng timeout
+CHECK_CONCURRENT = 50             # giảm concurrent để ổn định
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -77,7 +77,6 @@ def today_vn():
 def is_admin(uid):
     return uid == ADMIN_ID
 
-# ======================== INTERNAL HELPERS ========================
 def _clean_expired_keys_nolock():
     now = time.time()
     expired = [k for k, v in keys.items() if now - v.get("created_ts", 0) > KEY_EXPIRE_SECONDS]
@@ -197,45 +196,44 @@ def fetch_fast(n):
         stop_flag.set()
     return live_accs[:n]
 
-# ======================== CHECK ACC (SIÊU TỐC) ========================
-check_executor = ThreadPoolExecutor(max_workers=200)
-
-def check_acc_api(username, password):
+# ======================== CHECK ACC (AIOHTTP ASYNC) ========================
+async def check_acc_aiohttp(session: aiohttp.ClientSession, username: str, password: str) -> dict:
     try:
-        r = requests.post(CHECK_API_URL,
-                          data={"user": username, "pass": password, "apikey": CHECK_API_KEY},
-                          timeout=CHECK_TIMEOUT)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("ok") and d["result"].get("status") == "HIT":
-            info = d["result"]
-            skins = info.get("aov_skins", {})
-            ban_info = info.get("aov_banned", "NO")
-            ban_start = info.get("ban_start", "")
-            ban_end = info.get("ban_end", "")
-            if isinstance(ban_info, dict):
-                ban_start = ban_info.get("start", ban_start)
-                ban_end = ban_info.get("end", ban_end)
-                ban_status = "YES" if ban_info.get("status") == "banned" else "NO"
+        async with session.post(
+            CHECK_API_URL,
+            data={"user": username, "pass": password, "apikey": CHECK_API_KEY},
+            timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT)
+        ) as resp:
+            if resp.status != 200:
+                return {"status": "ERROR", "username": username, "message": f"HTTP {resp.status}"}
+            d = await resp.json()
+            if d.get("ok") and d["result"].get("status") == "HIT":
+                info = d["result"]
+                skins = info.get("aov_skins", {})
+                ban_info = info.get("aov_banned", "NO")
+                ban_start = info.get("ban_start", "")
+                ban_end = info.get("ban_end", "")
+                if isinstance(ban_info, dict):
+                    ban_start = ban_info.get("start", ban_start)
+                    ban_end = ban_info.get("end", ban_end)
+                    ban_status = "YES" if ban_info.get("status") == "banned" else "NO"
+                else:
+                    ban_status = ban_info
+                return {
+                    "status": "HIT", "username": username, "name": info.get("aov_name"),
+                    "uid": info.get("uid"), "rank": info.get("aov_rank"), "level": info.get("aov_level"),
+                    "skins": skins.get("total_skins", 0), "champs": skins.get("total_champs", 0),
+                    "banned": ban_status, "ban_start": ban_start, "ban_end": ban_end,
+                    "fb_linked": info.get("fb_linked"), "mobile_bound": info.get("mobile_bound"),
+                    "email_verified": info.get("email_verified"),
+                }
             else:
-                ban_status = ban_info
-            return {
-                "status": "HIT", "username": username, "name": info.get("aov_name"),
-                "uid": info.get("uid"), "rank": info.get("aov_rank"), "level": info.get("aov_level"),
-                "skins": skins.get("total_skins", 0), "champs": skins.get("total_champs", 0),
-                "banned": ban_status, "ban_start": ban_start, "ban_end": ban_end,
-                "fb_linked": info.get("fb_linked"), "mobile_bound": info.get("mobile_bound"),
-                "email_verified": info.get("email_verified"),
-            }
-        else:
-            return {"status": "MISS", "username": username,
-                    "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
+                return {"status": "MISS", "username": username,
+                        "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
+    except asyncio.TimeoutError:
+        return {"status": "ERROR", "username": username, "message": "Timeout"}
     except Exception as e:
         return {"status": "ERROR", "username": username, "message": str(e)}
-
-async def check_acc_async(username, password):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(check_executor, check_acc_api, username, password)
 
 # ======================== SPAM ========================
 request_log = defaultdict(list)
@@ -406,7 +404,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ Không lấy được acc.")
                 return
 
-            # GHI ĐÈ last_acc
             with users_lock:
                 if uid == ADMIN_ID:
                     u = users.setdefault("admin", {"history":[],"used":0,"daily_used":0,"banned":False,"vip":True,"last_acc":[],"checked_acc":[]})
@@ -475,17 +472,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 accs_to_check = acc_list[:can_check]
 
-            await query.edit_message_text(f"🔍 Đang check {can_check} acc...")
+            # Gửi tin nhắn chờ
+            wait_msg = await query.edit_message_text(f"🔍 Đang check {can_check} acc...")
             t0 = time.time()
+
+            # Chuẩn bị semaphore và session aiohttp
             sem = asyncio.Semaphore(CHECK_CONCURRENT)
-            async def limited_check(acc_str):
-                if "|" not in acc_str:
-                    return {"status": "ERROR", "username": acc_str, "message": "Sai định dạng"}
-                uname, pwd = acc_str.split("|", 1)
-                async with sem:
-                    return await check_acc_async(uname, pwd)
-            tasks = [limited_check(acc) for acc in accs_to_check]
-            results = await asyncio.gather(*tasks)
+            async with aiohttp.ClientSession() as session:
+                async def limited_check(acc_str):
+                    if "|" not in acc_str:
+                        return {"status": "ERROR", "username": acc_str, "message": "Sai định dạng"}
+                    uname, pwd = acc_str.split("|", 1)
+                    async with sem:
+                        return await check_acc_aiohttp(session, uname, pwd)
+
+                tasks = [limited_check(acc) for acc in accs_to_check]
+                results = await asyncio.gather(*tasks)
+
             t1 = time.time() - t0
 
             success_results = [r for r in results if r["status"] in ("HIT", "MISS")]
@@ -505,7 +508,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if len(checked) > MAX_CHECKED_ACC:
                         checked = checked[-MAX_CHECKED_ACC:]
                     u["checked_acc"] = checked
-                # Xóa acc đã check khỏi last_acc (giữ lại phần còn lại)
+                # Xóa acc đã check khỏi last_acc
                 if len(acc_list) > can_check:
                     u["last_acc"] = acc_list[can_check:]
                 else:
@@ -535,7 +538,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for r in miss[:5]: text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
             if len(text) > 4000: text = text[:4000] + "\n... (cắt bớt)"
             kb, _ = main_menu(uid)
-            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            try:
+                await wait_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            except Exception as e:
+                log.error(f"Lỗi edit tin nhắn check: {e}")
+                await context.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         finally:
             with processing_lock:
                 processing_users.discard(uid)
