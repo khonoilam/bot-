@@ -40,7 +40,8 @@ SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
 CHECK_TIMEOUT = 30
-CHECK_CONCURRENT = 5
+CHECK_CONCURRENT = 10          # Tăng nhẹ để nhanh hơn
+MAX_CHECK_PER_REQ = 5          # Giới hạn tối đa 5 acc mỗi lần check
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -57,7 +58,9 @@ users_lock = threading.Lock()
 acc_lock = threading.Lock()
 spam_lock = threading.Lock()
 data_lock = threading.Lock()
-processing_lock = threading.Lock()
+
+# ======================== USER LOCKS (mỗi user một lock) ========================
+user_locks = defaultdict(asyncio.Lock)
 
 # ======================== GLOBAL DATA ========================
 keys = {}
@@ -295,7 +298,7 @@ def main_menu(uid):
     text = (
         f"🤖 LQ ACC BOT\n{vip_text}\n"
         f"📊 Hôm nay: {used}/{limit} (Còn {remaining})\n"
-        f"🔍 Check: {check_rem} lượt\n"
+        f"🔍 Check: {check_rem} lượt (tối đa {MAX_CHECK_PER_REQ}/lần)\n"
         "⚡TangAcc\nChọn chức năng:"
     )
     return InlineKeyboardMarkup(keyboard), text
@@ -345,8 +348,6 @@ def update_check_count(uid, count, hit_details=None):
     save_data()
 
 # ======================== HANDLERS ========================
-processing_users = set()
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != ADMIN_ID and check_spam(uid):
@@ -385,6 +386,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
     data = query.data
 
+    # Kiểm tra auth và ban
     with users_lock:
         auth = (uid == ADMIN_ID) or (str(uid) in users and users[str(uid)].get("key") is not None)
         if not auth and data != "key_input":
@@ -400,19 +402,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚫 Spam!")
         return
 
-    if data.startswith("lay_"):
-        n = int(data.split("_")[1])
-        if uid != ADMIN_ID and n > MAX_PER_REQ:
-            await query.answer(f"Tối đa {MAX_PER_REQ} acc/lần.", show_alert=True)
-            n = MAX_PER_REQ
+    # Lấy lock của user để tránh xung đột (không ảnh hưởng user khác)
+    async with user_locks[uid]:
+        if data.startswith("lay_"):
+            n = int(data.split("_")[1])
+            if uid != ADMIN_ID and n > MAX_PER_REQ:
+                await query.answer(f"Tối đa {MAX_PER_REQ} acc/lần.", show_alert=True)
+                n = MAX_PER_REQ
 
-        with processing_lock:
-            if uid in processing_users:
-                await query.edit_message_text("⏳ Đợi...")
-                return
-            processing_users.add(uid)
-
-        try:
             with users_lock:
                 if uid == ADMIN_ID:
                     limit = 99999
@@ -459,7 +456,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if need_save:
                 save_data()
 
-            # Chuẩn bị nút check
+            # Chuẩn bị nút check (tối đa 5 acc)
             with users_lock:
                 if uid == ADMIN_ID:
                     check_rem = 99999
@@ -470,14 +467,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         check_rem = CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL
                     else:
                         check_rem = max(0, (CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL) - u.get("checked_today", 0))
-            check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
-                             for x in [5,10,15,20,25] if x <= check_rem and x <= total_acc]
-            reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
+            can_check = min(MAX_CHECK_PER_REQ, total_acc, check_rem)
+            check_buttons = []
+            if can_check >= 5:
+                check_buttons.append(InlineKeyboardButton("✅ Check 5", callback_data="checkacc_5"))
+            # Có thể thêm tùy chọn ít hơn nếu còn đủ
+            if can_check >= 3:
+                check_buttons.append(InlineKeyboardButton("Check 3", callback_data="checkacc_3"))
+            reply_markup = InlineKeyboardMarkup([check_buttons]) if check_buttons else None
 
-            # Hiển thị kết quả (luôn kèm nút check nếu có)
+            # Hiển thị kết quả
             acc_text = "\n".join(last_copy)
             if len(acc_text) > 3800 or total_acc > 20:
-                # Gửi file kèm
                 ts = int(time.time())
                 fn = f"{OUTPUT_DIR}/acclist_{uid}_{ts}.txt"
                 with open(fn, "w", encoding="utf-8") as f:
@@ -486,33 +487,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_document(chat_id=uid, document=f,
                                                     filename=f"acc_list_{ts}.txt",
                                                     caption=f"📁 {total_acc} acc ({t1:.1f}s)")
-                msg_text = f"✅ Đã lấy {total_acc} acc ({t1:.1f}s)\n📎 File đầy đủ bên dưới.\nChọn số acc muốn check:"
+                msg_text = f"✅ Đã lấy {total_acc} acc ({t1:.1f}s)\n📎 File đầy đủ bên dưới."
+                if check_buttons:
+                    msg_text += "\nChọn số acc muốn check:"
             else:
-                msg_text = f"🎉 {total_acc} acc ({t1:.1f}s)\n\n{acc_text}\nChọn số acc muốn check:"
-
-            # Nếu không có nút check thì ẩn dòng "Chọn số acc muốn check"
-            if not check_buttons:
-                msg_text = f"🎉 {total_acc} acc ({t1:.1f}s)\n\n{acc_text}" if total_acc <= 20 else f"✅ Đã lấy {total_acc} acc ({t1:.1f}s)\n📎 File đầy đủ bên dưới."
+                msg_text = f"🎉 {total_acc} acc ({t1:.1f}s)\n\n{acc_text}"
+                if check_buttons:
+                    msg_text += "\nChọn số acc muốn check:"
 
             await query.edit_message_text(msg_text, reply_markup=reply_markup)
 
-            # Gửi menu chính riêng
+            # Gửi menu chính
             kb, menu_text = main_menu(uid)
             await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
-        finally:
-            with processing_lock:
-                processing_users.discard(uid)
 
-    elif data.startswith("checkacc_"):
-        parts = data.split("_")
-        if len(parts) != 2: return
-        req_count = int(parts[1])
-        with processing_lock:
-            if uid in processing_users:
-                await query.answer("Đang xử lý, vui lòng đợi.", show_alert=True)
-                return
-            processing_users.add(uid)
-        try:
+        elif data.startswith("checkacc_"):
+            parts = data.split("_")
+            if len(parts) != 2: return
+            req_count = int(parts[1])
+            # Giới hạn tối đa 5
+            if req_count > MAX_CHECK_PER_REQ:
+                req_count = MAX_CHECK_PER_REQ
+
             original_msg = query.message
             with users_lock:
                 u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"last_acc":[]})
@@ -587,9 +583,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     check_rem = CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL
                 else:
                     check_rem = max(0, (CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL) - u2.get("checked_today", 0))
-            new_check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
-                                 for x in [5,10,15,20,25] if x <= check_rem and x <= new_total]
-            new_reply_markup = InlineKeyboardMarkup([new_check_buttons[i:i+3] for i in range(0, len(new_check_buttons), 3)]) if new_check_buttons else None
+            can_check_new = min(MAX_CHECK_PER_REQ, new_total, check_rem)
+            new_check_buttons = []
+            if can_check_new >= 5:
+                new_check_buttons.append(InlineKeyboardButton("✅ Check 5", callback_data="checkacc_5"))
+            if can_check_new >= 3:
+                new_check_buttons.append(InlineKeyboardButton("Check 3", callback_data="checkacc_3"))
+            new_reply_markup = InlineKeyboardMarkup([new_check_buttons]) if new_check_buttons else None
             new_acc_text = "\n".join(new_last[:20])
             if new_total > 20:
                 new_acc_text += f"\n... và {new_total-20} acc khác"
@@ -631,90 +631,87 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.error(f"Lỗi edit tin nhắn check: {e}")
                 await context.bot.send_message(chat_id=uid, text=text, reply_markup=kb)
-        finally:
-            with processing_lock:
-                processing_users.discard(uid)
 
-    elif data == "export":
-        with users_lock:
-            u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"history":[]})
-            history = list(u.get("history", []))
-        if not history:
-            await query.edit_message_text("📭 Chưa lấy acc nào.")
-            return
-        ts = int(time.time())
-        fn = f"{OUTPUT_DIR}/acc_tho_{uid}_{ts}.txt"
-        with open(fn, "w", encoding="utf-8") as f:
-            f.write("\n".join(history))
-        with open(fn, "rb") as f:
-            await context.bot.send_document(chat_id=uid, document=f, filename=f"acc_tho_{ts}.txt",
-                                            caption=f"📁 {len(history)} acc thô")
-        await query.edit_message_text("✅ Đã gửi file acc thô!")
+        elif data == "export":
+            with users_lock:
+                u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"history":[]})
+                history = list(u.get("history", []))
+            if not history:
+                await query.edit_message_text("📭 Chưa lấy acc nào.")
+                return
+            ts = int(time.time())
+            fn = f"{OUTPUT_DIR}/acc_tho_{uid}_{ts}.txt"
+            with open(fn, "w", encoding="utf-8") as f:
+                f.write("\n".join(history))
+            with open(fn, "rb") as f:
+                await context.bot.send_document(chat_id=uid, document=f, filename=f"acc_tho_{ts}.txt",
+                                                caption=f"📁 {len(history)} acc thô")
+            await query.edit_message_text("✅ Đã gửi file acc thô!")
 
-    elif data == "export_checked":
-        with users_lock:
-            u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"checked_acc":[]})
-            checked = list(u.get("checked_acc", []))
-        if not checked:
-            await query.edit_message_text("📭 Chưa check acc nào.")
-            return
-        ts = int(time.time())
-        fn = f"{OUTPUT_DIR}/acc_check_{uid}_{ts}.txt"
-        with open(fn, "w", encoding="utf-8") as f:
-            for item in checked:
-                line = (
-                    f"User: {item['username']}\n"
-                    f"Name: {item['name']}\n"
-                    f"Rank: {item['rank']} | Lv: {item['level']}\n"
-                    f"Skin: {item['skins']} | Tướng: {item['champs']}\n"
-                    f"Ban: {item['banned']}"
-                )
-                if item['banned'] == 'YES':
-                    if item.get('ban_start') and item.get('ban_end'):
-                        line += f" ({item['ban_start']} → {item['ban_end']})"
-                    elif item.get('ban_start'):
-                        line += f" (từ {item['ban_start']})"
-                line += (
-                    f"\nFB: {item['fb_linked']} | SĐT: {item['mobile_bound']} | Email: {item['email_verified']}\n"
-                    f"{'─'*30}\n"
-                )
-                f.write(line)
-        with open(fn, "rb") as f:
-            await context.bot.send_document(chat_id=uid, document=f, filename=f"acc_check_{ts}.txt",
-                                            caption=f"📁 {len(checked)} acc đã check")
-        await query.edit_message_text("✅ Đã gửi file acc check!")
+        elif data == "export_checked":
+            with users_lock:
+                u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"checked_acc":[]})
+                checked = list(u.get("checked_acc", []))
+            if not checked:
+                await query.edit_message_text("📭 Chưa check acc nào.")
+                return
+            ts = int(time.time())
+            fn = f"{OUTPUT_DIR}/acc_check_{uid}_{ts}.txt"
+            with open(fn, "w", encoding="utf-8") as f:
+                for item in checked:
+                    line = (
+                        f"User: {item['username']}\n"
+                        f"Name: {item['name']}\n"
+                        f"Rank: {item['rank']} | Lv: {item['level']}\n"
+                        f"Skin: {item['skins']} | Tướng: {item['champs']}\n"
+                        f"Ban: {item['banned']}"
+                    )
+                    if item['banned'] == 'YES':
+                        if item.get('ban_start') and item.get('ban_end'):
+                            line += f" ({item['ban_start']} → {item['ban_end']})"
+                        elif item.get('ban_start'):
+                            line += f" (từ {item['ban_start']})"
+                    line += (
+                        f"\nFB: {item['fb_linked']} | SĐT: {item['mobile_bound']} | Email: {item['email_verified']}\n"
+                        f"{'─'*30}\n"
+                    )
+                    f.write(line)
+            with open(fn, "rb") as f:
+                await context.bot.send_document(chat_id=uid, document=f, filename=f"acc_check_{ts}.txt",
+                                                caption=f"📁 {len(checked)} acc đã check")
+            await query.edit_message_text("✅ Đã gửi file acc check!")
 
-    elif data == "profile":
-        with users_lock:
-            u = _get_user_copy(uid)
-            if uid == ADMIN_ID:
-                limit = 99999
-                check_rem = 99999
-            else:
-                limit = LIMIT_VIP if u.get("vip") else LIMIT_NORMAL
-                today = today_vn()
-                if u.get("last_check_date") != today:
-                    check_rem = CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL
+        elif data == "profile":
+            with users_lock:
+                u = _get_user_copy(uid)
+                if uid == ADMIN_ID:
+                    limit = 99999
+                    check_rem = 99999
                 else:
-                    check_rem = max(0, (CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL) - u.get("checked_today", 0))
-            vip_text = "👑 Admin" if uid == ADMIN_ID else ("👑 VIP" if u.get("vip") else "🔑 Thường")
-            total_acc = len(u.get("last_acc", []))
-            checked_count = len(u.get("checked_acc", []))
-        await query.edit_message_text(
-            f"👤 {vip_text}\n📊 Lấy: {u.get('daily_used',0)}/{limit}\n"
-            f"📦 Tổng acc đã lấy: {u.get('used',0)}\n"
-            f"🔍 Check còn: {check_rem} lượt\n"
-            f"📋 Acc chờ check: {total_acc}\n"
-            f"✅ Đã check: {checked_count} acc"
-        )
+                    limit = LIMIT_VIP if u.get("vip") else LIMIT_NORMAL
+                    today = today_vn()
+                    if u.get("last_check_date") != today:
+                        check_rem = CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL
+                    else:
+                        check_rem = max(0, (CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL) - u.get("checked_today", 0))
+                vip_text = "👑 Admin" if uid == ADMIN_ID else ("👑 VIP" if u.get("vip") else "🔑 Thường")
+                total_acc = len(u.get("last_acc", []))
+                checked_count = len(u.get("checked_acc", []))
+            await query.edit_message_text(
+                f"👤 {vip_text}\n📊 Lấy: {u.get('daily_used',0)}/{limit}\n"
+                f"📦 Tổng acc đã lấy: {u.get('used',0)}\n"
+                f"🔍 Check còn: {check_rem} lượt\n"
+                f"📋 Acc chờ check: {total_acc}\n"
+                f"✅ Đã check: {checked_count} acc"
+            )
 
-    elif data == "key_input":
-        with users_lock:
-            auth = (uid == ADMIN_ID) or (str(uid) in users and users[str(uid)].get("key") is not None)
-        if auth:
-            await query.answer("Bạn đã có key rồi!", show_alert=True)
-        else:
-            await query.edit_message_text("📝 Gửi key của bạn: /key <mã>")
+        elif data == "key_input":
+            with users_lock:
+                auth = (uid == ADMIN_ID) or (str(uid) in users and users[str(uid)].get("key") is not None)
+            if auth:
+                await query.answer("Bạn đã có key rồi!", show_alert=True)
+            else:
+                await query.edit_message_text("📝 Gửi key của bạn: /key <mã>")
 
 # ======================== COMMAND HANDLERS ========================
 async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -770,39 +767,35 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if check_spam(uid):
         await update.message.reply_text("🚫 Spam!")
         return
-    with users_lock:
-        u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
-        if u.get("banned"):
-            await update.message.reply_text("🚫 Bị khóa")
-            return
-        if uid != ADMIN_ID:
-            if u.get("date") != today_vn():
-                u["date"] = today_vn()
-                u["daily_used"] = 0
-            limit = LIMIT_VIP if u.get("vip") else LIMIT_NORMAL
-            remaining = limit - u.get("daily_used", 0)
-            try:
-                n = int(context.args[0]) if context.args else 10
-            except:
-                n = 10
-            if n > remaining:
-                await update.message.reply_text(f"⚠️ Còn {remaining} acc")
+    # Sử dụng lock riêng của user
+    async with user_locks[uid]:
+        with users_lock:
+            u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
+            if u.get("banned"):
+                await update.message.reply_text("🚫 Bị khóa")
                 return
-        else:
-            try:
-                n = int(context.args[0]) if context.args else 10
-            except:
-                n = 10
-        if n > MAX_PER_REQ and uid != ADMIN_ID:
-            await update.message.reply_text(f"Tối đa {MAX_PER_REQ} acc/lần.")
-            n = MAX_PER_REQ
+            if uid != ADMIN_ID:
+                if u.get("date") != today_vn():
+                    u["date"] = today_vn()
+                    u["daily_used"] = 0
+                limit = LIMIT_VIP if u.get("vip") else LIMIT_NORMAL
+                remaining = limit - u.get("daily_used", 0)
+                try:
+                    n = int(context.args[0]) if context.args else 10
+                except:
+                    n = 10
+                if n > remaining:
+                    await update.message.reply_text(f"⚠️ Còn {remaining} acc")
+                    return
+            else:
+                try:
+                    n = int(context.args[0]) if context.args else 10
+                except:
+                    n = 10
+            if n > MAX_PER_REQ and uid != ADMIN_ID:
+                await update.message.reply_text(f"Tối đa {MAX_PER_REQ} acc/lần.")
+                n = MAX_PER_REQ
 
-    with processing_lock:
-        if uid in processing_users:
-            await update.message.reply_text("⏳ Đợi...")
-            return
-        processing_users.add(uid)
-    try:
         msg = await update.message.reply_text(f"⏳ {n} acc...")
         loop = asyncio.get_event_loop()
         accs = await loop.run_in_executor(None, fetch_fast, n)
@@ -832,9 +825,13 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     check_rem = CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL
                 else:
                     check_rem = max(0, (CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL) - u.get("checked_today", 0))
-        check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
-                         for x in [5,10,15,20,25] if x <= check_rem and x <= total_acc]
-        reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
+        can_check = min(MAX_CHECK_PER_REQ, total_acc, check_rem)
+        check_buttons = []
+        if can_check >= 5:
+            check_buttons.append(InlineKeyboardButton("✅ Check 5", callback_data="checkacc_5"))
+        if can_check >= 3:
+            check_buttons.append(InlineKeyboardButton("Check 3", callback_data="checkacc_3"))
+        reply_markup = InlineKeyboardMarkup([check_buttons]) if check_buttons else None
 
         acc_text = "\n".join(last_copy)
         if len(acc_text) > 3800 or total_acc > 20:
@@ -846,20 +843,18 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_document(chat_id=uid, document=f,
                                                 filename=f"acc_list_{ts}.txt",
                                                 caption=f"📁 {total_acc} acc")
-            msg_text = f"✅ Đã lấy {total_acc} acc\n📎 File đầy đủ bên dưới.\nChọn số acc muốn check:"
+            msg_text = f"✅ Đã lấy {total_acc} acc\n📎 File đầy đủ bên dưới."
+            if check_buttons:
+                msg_text += "\nChọn số acc muốn check:"
         else:
-            msg_text = f"🎉 {total_acc} acc\n\n{acc_text}\nChọn số acc muốn check:"
-
-        if not check_buttons:
-            msg_text = f"🎉 {total_acc} acc\n\n{acc_text}" if total_acc <= 20 else f"✅ Đã lấy {total_acc} acc\n📎 File đầy đủ bên dưới."
+            msg_text = f"🎉 {total_acc} acc\n\n{acc_text}"
+            if check_buttons:
+                msg_text += "\nChọn số acc muốn check:"
 
         await msg.edit_text(msg_text, reply_markup=reply_markup)
 
         kb, menu_text = main_menu(uid)
         await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
-    finally:
-        with processing_lock:
-            processing_users.discard(uid)
 
 # ======================== ADMIN HANDLERS ========================
 async def genkey(update, context):
