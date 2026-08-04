@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
 from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ======================== FLASK KEEP-ALIVE ========================
 app = Flask(__name__)
@@ -41,11 +41,6 @@ MAX_SPAM = 5
 MUTE_TIME = 60
 CHECK_TIMEOUT = 30
 CHECK_CONCURRENT = 5
-AI_API_URL = "https://drift-ai-api.vercel.app/ask"
-AI_API_KEY = "drift"
-AI_TYPE = "gpt-oss"
-AI_RATE_LIMIT = 10  # lần/phút
-AI_RATE_WINDOW = 60
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -63,13 +58,11 @@ acc_lock = threading.Lock()
 spam_lock = threading.Lock()
 data_lock = threading.Lock()
 processing_lock = threading.Lock()
-ai_lock = threading.Lock()
 
 # ======================== GLOBAL DATA ========================
 keys = {}
 users = {}
 used_accounts = set()
-ai_requests = defaultdict(list)
 
 HEADERS = {
     "authority": "tangacc.net", "accept": "*/*", "accept-language": "en-US,en;q=0.9",
@@ -252,69 +245,6 @@ async def check_acc_aiohttp(session: aiohttp.ClientSession, username: str, passw
             return {"status": "ERROR", "username": username, "message": str(e)}
     return {"status": "ERROR", "username": username, "message": "Thất bại sau 4 lần thử"}
 
-# ======================== AI ENGINE ========================
-async def ask_ai(question: str) -> str:
-    params = {"q": question, "key": AI_API_KEY, "type": AI_TYPE}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(AI_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("response", data.get("answer", str(data)))
-                else:
-                    return f"❌ Lỗi AI: HTTP {resp.status}"
-    except asyncio.TimeoutError:
-        return "⏳ AI đang bận, thử lại sau."
-    except Exception as e:
-        return f"⚠️ Lỗi kết nối AI: {str(e)}"
-
-def check_ai_rate_limit(uid) -> bool:
-    now = time.time()
-    with ai_lock:
-        times = ai_requests[uid]
-        times = [t for t in times if now - t < AI_RATE_WINDOW]
-        ai_requests[uid] = times
-        if len(times) >= AI_RATE_LIMIT:
-            return False
-        times.append(now)
-        ai_requests[uid] = times
-        return True
-
-async def find_acc_by_request(uid, request: str):
-    """Dùng AI để tìm acc trong checked_acc của user"""
-    with users_lock:
-        u = _get_user_copy(uid)
-        checked = u.get("checked_acc", [])
-    if not checked:
-        return None, "Bạn chưa check acc nào. Hãy lấy và check acc trước."
-
-    # Chuẩn bị prompt cho AI
-    prompt = f"""Bạn có danh sách acc Liên Quân đã check sau (mỗi acc là 1 dict):
-{json.dumps(checked, ensure_ascii=False, indent=2)}
-
-Người dùng yêu cầu: "{request}"
-
-Hãy tìm acc phù hợp NHẤT với yêu cầu. Trả lời NGẮN GỌN theo định dạng:
-USERNAME|<tên ingame>|<rank>|<skin>|<tướng>|<ban>|<lý do chọn>
-
-Nếu không có acc nào phù hợp, trả lời: KHONG_CO_ACC
-"""
-    ai_response = await ask_ai(prompt)
-    if "KHONG_CO_ACC" in ai_response:
-        return None, "Không tìm thấy acc phù hợp yêu cầu."
-    # Parse phản hồi AI (định dạng USERNAME|name|rank|skin|champ|ban|reason)
-    parts = ai_response.split("|")
-    if len(parts) >= 6:
-        username = parts[0].strip()
-        # Tìm acc gốc trong checked
-        for acc in checked:
-            if acc.get("username") == username:
-                return acc, None
-        return None, f"AI gợi ý acc {username} nhưng không tìm thấy trong dữ liệu."
-    else:
-        # AI trả lời không đúng định dạng, trả về text thô
-        return None, f"AI trả lời:\n{ai_response}"
-
 # ======================== SPAM ========================
 request_log = defaultdict(list)
 muted_users = {}
@@ -366,7 +296,6 @@ def main_menu(uid):
         f"🤖 LQ ACC BOT\n{vip_text}\n"
         f"📊 Hôm nay: {used}/{limit} (Còn {remaining})\n"
         f"🔍 Check: {check_rem} lượt\n"
-        "💬 Chat để AI tìm acc\n"
         "⚡TangAcc\nChọn chức năng:"
     )
     return InlineKeyboardMarkup(keyboard), text
@@ -545,10 +474,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              for x in [5,10,15,20,25] if x <= check_rem and x <= total_acc]
             reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
 
-            # Hiển thị kết quả
+            # Hiển thị kết quả (luôn kèm nút check nếu có)
             acc_text = "\n".join(last_copy)
             if len(acc_text) > 3800 or total_acc > 20:
-                # Gửi file
+                # Gửi file kèm
                 ts = int(time.time())
                 fn = f"{OUTPUT_DIR}/acclist_{uid}_{ts}.txt"
                 with open(fn, "w", encoding="utf-8") as f:
@@ -560,6 +489,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg_text = f"✅ Đã lấy {total_acc} acc ({t1:.1f}s)\n📎 File đầy đủ bên dưới.\nChọn số acc muốn check:"
             else:
                 msg_text = f"🎉 {total_acc} acc ({t1:.1f}s)\n\n{acc_text}\nChọn số acc muốn check:"
+
+            # Nếu không có nút check thì ẩn dòng "Chọn số acc muốn check"
+            if not check_buttons:
+                msg_text = f"🎉 {total_acc} acc ({t1:.1f}s)\n\n{acc_text}" if total_acc <= 20 else f"✅ Đã lấy {total_acc} acc ({t1:.1f}s)\n📎 File đầy đủ bên dưới."
 
             await query.edit_message_text(msg_text, reply_markup=reply_markup)
 
@@ -656,13 +589,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     check_rem = max(0, (CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL) - u2.get("checked_today", 0))
             new_check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
                                  for x in [5,10,15,20,25] if x <= check_rem and x <= new_total]
+            new_reply_markup = InlineKeyboardMarkup([new_check_buttons[i:i+3] for i in range(0, len(new_check_buttons), 3)]) if new_check_buttons else None
             new_acc_text = "\n".join(new_last[:20])
             if new_total > 20:
                 new_acc_text += f"\n... và {new_total-20} acc khác"
             new_msg_text = f"🎉 Còn {new_total} acc chưa check\n\n{new_acc_text}"
             if len(new_msg_text) > 4000:
                 new_msg_text = new_msg_text[:4000] + "\n... (cắt bớt)"
-            new_reply_markup = InlineKeyboardMarkup([new_check_buttons[i:i+3] for i in range(0, len(new_check_buttons), 3)]) if new_check_buttons else None
             try:
                 await original_msg.edit_text(new_msg_text, reply_markup=new_reply_markup)
             except Exception as e:
@@ -783,58 +716,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("📝 Gửi key của bạn: /key <mã>")
 
-# ======================== XỬ LÝ TIN NHẮN THƯỜNG (AI TÌM ACC) ========================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-    if not text or text.startswith("/"):
-        return  # Bỏ qua lệnh
-
-    # Chỉ xử lý nếu đã auth
-    with users_lock:
-        auth = (uid == ADMIN_ID) or (str(uid) in users and users[str(uid)].get("key") is not None)
-        if not auth:
-            await update.message.reply_text("🔐 Bạn chưa có key. Nhấn /start để nhập key.")
-            return
-        if users.get(str(uid), {}).get("banned"):
-            await update.message.reply_text("🚫 Bạn đã bị khóa.")
-            return
-
-    # Kiểm tra rate limit AI
-    if not check_ai_rate_limit(uid):
-        await update.message.reply_text("⏳ Bạn dùng AI quá nhanh. Vui lòng đợi 1 phút.")
-        return
-
-    # Gửi trạng thái đang xử lý
-    wait_msg = await update.message.reply_text("🔍 AI đang tìm acc cho bạn...")
-
-    try:
-        acc, error = await find_acc_by_request(uid, text)
-        if error:
-            await wait_msg.edit_text(f"🤖 AI: {error}")
-        else:
-            # Tạo kết quả đẹp
-            ban_text = "Không"
-            if acc.get("banned") == "YES":
-                ban_text = "Có"
-                if acc.get("ban_start") and acc.get("ban_end"):
-                    ban_text += f" ({acc['ban_start']} → {acc['ban_end']})"
-                elif acc.get("ban_start"):
-                    ban_text += f" (từ {acc['ban_start']})"
-            result_text = (
-                f"🤖 AI đã tìm thấy acc:\n\n"
-                f"👤 {acc['username']} - {acc.get('name','?')}\n"
-                f"├ Rank: {acc.get('rank','?')} | Lv: {acc.get('level','?')}\n"
-                f"├ Skin: {acc.get('skins',0)} | Tướng: {acc.get('champs',0)}\n"
-                f"├ Ban: {ban_text}\n"
-                f"├ FB: {acc.get('fb_linked','?')} | SĐT: {acc.get('mobile_bound','?')}\n"
-                f"└ Email: {acc.get('email_verified','?')}"
-            )
-            await wait_msg.edit_text(result_text)
-    except Exception as e:
-        await wait_msg.edit_text(f"⚠️ Lỗi: {str(e)}")
-
-# ======================== COMMAND HANDLERS (GIỮ NGUYÊN) ========================
+# ======================== COMMAND HANDLERS ========================
 async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     if not context.args:
@@ -881,7 +763,6 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Tương tự như trong button_handler, code ngắn gọn
     uid = update.effective_user.id
     if not is_admin(uid) and not (str(uid) in users and users.get(str(uid), {}).get("key")):
         await update.message.reply_text("🔐 Chưa nhập key.")
@@ -968,6 +849,10 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg_text = f"✅ Đã lấy {total_acc} acc\n📎 File đầy đủ bên dưới.\nChọn số acc muốn check:"
         else:
             msg_text = f"🎉 {total_acc} acc\n\n{acc_text}\nChọn số acc muốn check:"
+
+        if not check_buttons:
+            msg_text = f"🎉 {total_acc} acc\n\n{acc_text}" if total_acc <= 20 else f"✅ Đã lấy {total_acc} acc\n📎 File đầy đủ bên dưới."
+
         await msg.edit_text(msg_text, reply_markup=reply_markup)
 
         kb, menu_text = main_menu(uid)
@@ -1000,7 +885,7 @@ async def genvip(update, context):
         new = []
         for _ in range(n):
             k = secrets.token_hex(8).upper()
-            keys[k] = {"type":"vip","vip":True,"created":datetime.now(TZ).strftime("%d/%m/%Y %M:%S"),"created_ts":time.time()}
+            keys[k] = {"type":"vip","vip":True,"created":datetime.now(TZ).strftime("%d/%m/%Y %H:%M"),"created_ts":time.time()}
             new.append(k)
     save_data()
     await update.message.reply_text(f"👑 Key VIP ({LIMIT_VIP}/ngày) - 24h:\n" + "\n".join(k for k in new))
@@ -1166,17 +1051,15 @@ if __name__ == "__main__":
     log.info(f"🤖 LQ ACC BOT | Admin:{ADMIN_ID}")
     load_data()
     application = Application.builder().token(BOT_TOKEN).build()
-    # Command handlers
-    for cmd, h in [
+    handlers = [
         ("start", start), ("key", key_cmd), ("lay", lay),
         ("genkey", genkey), ("genvip", genvip), ("status", key_status), ("users", users_list),
         ("stats", stats), ("keys", listkeys), ("ban", ban), ("unban", unban), ("revoke", revoke),
         ("reset", reset), ("delkey", delkey), ("muted", muted_list), ("unmute", unmute_cmd),
         ("resetall", resetall)
-    ]:
+    ]
+    for cmd, h in handlers:
         application.add_handler(CommandHandler(cmd, h))
     application.add_handler(CallbackQueryHandler(button_handler))
-    # Xử lý tin nhắn thường (AI tìm acc) - phải để sau cùng
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     application.run_polling(drop_pending_updates=True)
