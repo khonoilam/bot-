@@ -34,13 +34,13 @@ LIMIT_VIP = 550
 CHECK_LIMIT_NORMAL = 25
 CHECK_LIMIT_VIP = 75
 MAX_PER_REQ = 50
-KEY_EXPIRE_SECONDS = 86400
+KEY_EXPIRE_SECONDS = 86400  # 24 giờ
 TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
-CHECK_TIMEOUT = 30          # tăng timeout cho Render
-CHECK_CONCURRENT = 5        # giảm concurrent tránh rate limit
+CHECK_TIMEOUT = 30
+CHECK_CONCURRENT = 5
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -77,13 +77,14 @@ def is_admin(uid):
     return uid == ADMIN_ID
 
 def _clean_expired_keys_nolock():
+    """Xóa key hết hạn (phải gọi khi đã giữ keys_lock). Trả về số key đã xóa."""
     now = time.time()
     expired = [k for k, v in keys.items() if now - v.get("created_ts", 0) > KEY_EXPIRE_SECONDS]
     for k in expired:
         del keys[k]
     if expired:
         log.info(f"Đã xóa {len(expired)} key hết hạn")
-    return bool(expired)
+    return len(expired)
 
 def _get_user_copy(uid):
     if uid == ADMIN_ID:
@@ -325,8 +326,47 @@ def login_menu():
         [InlineKeyboardButton("🔗 Lấy Key Free", url="https://t.me/chantuiii")],
     ])
 
+# ======================== UPDATE CHECK COUNT ========================
+def update_check_count(uid, count, hit_details=None):
+    uid = str(uid)
+    if uid not in users: return
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    with users_lock:
+        user = users[uid]
+        if user.get("last_check_date") != today:
+            user["last_check_date"] = today
+            user["checked_today"] = count
+        else:
+            user["checked_today"] = user.get("checked_today", 0) + count
+        if hit_details:
+            checked = user.setdefault("checked_acc", [])
+            checked.extend(hit_details)
+            if len(checked) > MAX_CHECKED_ACC:
+                user["checked_acc"] = checked[-MAX_CHECKED_ACC:]
+    save_data()
+
 # ======================== HANDLERS ========================
 processing_users = set()
+
+async def send_acc_list_async(context, uid, accs, elapsed):
+    """Gửi danh sách acc: nếu dài -> gửi file, ngắn -> gửi text"""
+    total = len(accs)
+    acc_text = "\n".join(accs)
+    if len(acc_text) > 3800 or total > 20:
+        ts = int(time.time())
+        fn = f"{OUTPUT_DIR}/acclist_{uid}_{ts}.txt"
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write("\n".join(accs))
+        with open(fn, "rb") as f:
+            await context.bot.send_document(
+                chat_id=uid,
+                document=f,
+                filename=f"acc_list_{ts}.txt",
+                caption=f"📁 {total} acc ({elapsed:.1f}s)"
+            )
+        return f"✅ Đã lấy {total} acc ({elapsed:.1f}s)\n📎 Danh sách acc đầy đủ được gửi kèm file bên dưới."
+    else:
+        return f"🎉 {total} acc ({elapsed:.1f}s)\n\n{acc_text}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -353,7 +393,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text, reply_markup=kb)
         else:
             await update.message.reply_text(
-                "🤖 LQ ACC BOT\n\n🔐 Chưa có key.\n👉 Nhấn nút dưới.",
+                "🤖 LQ ACC BOT\n\n"
+                "🔐 Bạn chưa có key.\n"
+                "👉 Nhấn nút \"Lấy Key Free\" bên dưới để ib chủ bot nhận key.\n"
+                "Nếu đã có key, nhấn \"Nhập Key\".",
                 reply_markup=login_menu()
             )
 
@@ -432,31 +475,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 u["daily_used"] = u.get("daily_used", 0) + len(accs)
                 u["last_acc"] = accs.copy()
                 last_copy = list(accs)
-                total_acc = len(accs)
 
             if need_save:
                 save_data()
 
-            with users_lock:
-                if uid == ADMIN_ID:
-                    check_rem = 99999
-                else:
-                    u = users[str(uid)]
-                    today = today_vn()
-                    if u.get("last_check_date") != today:
-                        check_rem = CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL
-                    else:
-                        check_rem = max(0, (CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL) - u.get("checked_today", 0))
-            check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
-                             for x in [5,10,15,20,25] if x <= check_rem and x <= total_acc]
-            acc_text = "\n".join(last_copy[:20])
-            if total_acc > 20:
-                acc_text += f"\n... và {total_acc-20} acc khác"
-            msg = f"🎉 {len(accs)} acc ({t1:.1f}s)\n\n{acc_text}"
-            if len(msg) > 4000:
-                msg = msg[:4000] + "\n... (cắt bớt)"
-            reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
-            await query.edit_message_text(msg, reply_markup=reply_markup)
+            # Gửi kết quả (text hoặc file)
+            msg_text = await send_acc_list_async(context, uid, last_copy, t1)
+            await query.edit_message_text(msg_text)
+
             # Gửi menu chính riêng
             kb, menu_text = main_menu(uid)
             await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
@@ -509,22 +535,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             t1 = time.time() - t0
 
             success_results = [r for r in results if r["status"] in ("HIT", "MISS")]
-            hit_acc_strs = [accs_to_check[i] for i, r in enumerate(results) if r["status"] == "HIT"]
+            hit_details = []
+            for i, r in enumerate(results):
+                if r["status"] == "HIT":
+                    hit_details.append({
+                        "username": r["username"],
+                        "name": r.get("name", "?"),
+                        "rank": r.get("rank", "?"),
+                        "level": r.get("level", "?"),
+                        "skins": r.get("skins", 0),
+                        "champs": r.get("champs", 0),
+                        "banned": r.get("banned", "NO"),
+                        "ban_start": r.get("ban_start", ""),
+                        "ban_end": r.get("ban_end", ""),
+                        "fb_linked": r.get("fb_linked", "?"),
+                        "mobile_bound": r.get("mobile_bound", "?"),
+                        "email_verified": r.get("email_verified", "?"),
+                    })
 
             with users_lock:
                 u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {"history":[],"last_acc":[],"checked_acc":[],"last_check_date":"","checked_today":0})
                 if success_results:
-                    today = today_vn()
-                    if u.get("last_check_date") != today:
-                        u["last_check_date"] = today
-                        u["checked_today"] = len(success_results)
-                    else:
-                        u["checked_today"] = u.get("checked_today", 0) + len(success_results)
-                    checked = u.get("checked_acc", [])
-                    checked.extend(hit_acc_strs)
-                    if len(checked) > MAX_CHECKED_ACC:
-                        checked = checked[-MAX_CHECKED_ACC:]
-                    u["checked_acc"] = checked
+                    update_check_count(uid, len(success_results), hit_details)
                 if len(acc_list) > can_check:
                     new_last = acc_list[can_check:]
                 else:
@@ -533,7 +565,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if uid != ADMIN_ID:
                 save_data()
 
-            # Cập nhật original message
+            # Cập nhật original message (danh sách acc chờ check còn lại)
             with users_lock:
                 u2 = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
                 new_total = len(new_last)
@@ -556,6 +588,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.error(f"Không thể cập nhật tin nhắn gốc: {e}")
 
+            # Kết quả check
             hit = [r for r in results if r["status"] == "HIT"]
             miss = [r for r in results if r["status"] != "HIT"]
             text = f"📊 Kết quả check {len(results)} acc ({t1:.1f}s)\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
@@ -615,7 +648,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ts = int(time.time())
         fn = f"{OUTPUT_DIR}/acc_check_{uid}_{ts}.txt"
         with open(fn, "w", encoding="utf-8") as f:
-            f.write("\n".join(checked))
+            for item in checked:
+                line = (
+                    f"User: {item['username']}\n"
+                    f"Name: {item['name']}\n"
+                    f"Rank: {item['rank']} | Lv: {item['level']}\n"
+                    f"Skin: {item['skins']} | Tướng: {item['champs']}\n"
+                    f"Ban: {item['banned']}"
+                )
+                if item['banned'] == 'YES':
+                    if item.get('ban_start') and item.get('ban_end'):
+                        line += f" ({item['ban_start']} → {item['ban_end']})"
+                    elif item.get('ban_start'):
+                        line += f" (từ {item['ban_start']})"
+                line += (
+                    f"\nFB: {item['fb_linked']} | SĐT: {item['mobile_bound']} | Email: {item['email_verified']}\n"
+                    f"{'─'*30}\n"
+                )
+                f.write(line)
         with open(fn, "rb") as f:
             await context.bot.send_document(chat_id=uid, document=f, filename=f"acc_check_{ts}.txt",
                                             caption=f"📁 {len(checked)} acc đã check")
@@ -662,6 +712,8 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expired = False
     is_vip = False
     with keys_lock:
+        # Dọn key hết hạn trước khi kiểm tra
+        _clean_expired_keys_nolock()
         if key not in keys:
             await update.message.reply_text("🔐 Key không đúng hoặc đã hết hạn (key chỉ tồn tại 24h).")
             return
@@ -753,27 +805,12 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["daily_used"] = u.get("daily_used", 0) + len(accs)
             u["last_acc"] = accs.copy()
             last_copy = list(accs)
-            total_acc = len(accs)
         if uid != ADMIN_ID:
             save_data()
-        with users_lock:
-            if uid == ADMIN_ID:
-                check_rem = 99999
-            else:
-                u = users[str(uid)]
-                today = today_vn()
-                if u.get("last_check_date") != today:
-                    check_rem = CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL
-                else:
-                    check_rem = max(0, (CHECK_LIMIT_VIP if u.get("vip") else CHECK_LIMIT_NORMAL) - u.get("checked_today", 0))
-        check_buttons = [InlineKeyboardButton(f"✅ Check {x}", callback_data=f"checkacc_{x}")
-                         for x in [5,10,15,20,25] if x <= check_rem and x <= total_acc]
-        acc_text = "\n".join(last_copy[:20])
-        if total_acc > 20:
-            acc_text += f"\n... và {total_acc-20} acc khác"
-        text = f"🎉 {len(accs)} acc\n\n{acc_text}"
-        reply_markup = InlineKeyboardMarkup([check_buttons[i:i+3] for i in range(0, len(check_buttons), 3)]) if check_buttons else None
-        await msg.edit_text(text, reply_markup=reply_markup)
+
+        # Gửi kết quả
+        msg_text = await send_acc_list_async(context, uid, last_copy, 0)  # elapsed tính sau
+        await msg.edit_text(msg_text)
         # Gửi menu chính riêng
         kb, menu_text = main_menu(uid)
         await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
