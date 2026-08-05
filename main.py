@@ -22,7 +22,7 @@ BOT_TOKEN = "8258187122:AAExWr8i1jAeqZJbxnWkLW39gGA_FQN3I1I"
 ADMIN_ID = 8721023843
 TANGACC_TOKEN = "https://tangacc.net/token.php"
 TANGACC_ACC   = "https://tangacc.net/get_lq_acc.php"
-THREADS = 70
+THREADS = 50                    # Giảm nhẹ để tiết kiệm tài nguyên
 TIMEOUT = 10
 CHECK_API_URL = "http://160.22.107.245:5000/check"
 CHECK_API_KEY = "RSAEJ8rdtRaMLfVUCB70Mh8pL0SFSDDx"
@@ -40,8 +40,8 @@ SPAM_WINDOW = 10
 MAX_SPAM = 5
 MUTE_TIME = 60
 CHECK_TIMEOUT = 30
-CHECK_CONCURRENT = 10          # Tăng nhẹ để nhanh hơn
-MAX_CHECK_PER_REQ = 5          # Giới hạn tối đa 5 acc mỗi lần check
+CHECK_CONCURRENT = 10
+MAX_CHECK_PER_REQ = 5          # Tối đa 5 acc mỗi lần check
 OUTPUT_DIR = "lq_data"
 MAX_HISTORY = 2000
 MAX_LAST_ACC = 500
@@ -52,6 +52,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger(__name__)
 
+# ======================== EXECUTOR TOÀN CỤC ========================
+global_executor = ThreadPoolExecutor(max_workers=200)
+
 # ======================== LOCKS ========================
 keys_lock = threading.Lock()
 users_lock = threading.Lock()
@@ -59,7 +62,7 @@ acc_lock = threading.Lock()
 spam_lock = threading.Lock()
 data_lock = threading.Lock()
 
-# ======================== USER LOCKS (mỗi user một lock) ========================
+# ======================== USER LOCKS (mỗi user một asyncio.Lock) ========================
 user_locks = defaultdict(asyncio.Lock)
 
 # ======================== GLOBAL DATA ========================
@@ -173,7 +176,7 @@ def fetch_fast(n):
                 acc = get_acc(session)
                 if not acc:
                     fail_count += 1
-                    if fail_count > 15:
+                    if fail_count > 10:   # Giảm số lần thử
                         break
                     continue
                 fail_count = 0
@@ -192,9 +195,9 @@ def fetch_fast(n):
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
         for _ in range(THREADS):
             ex.submit(worker)
-        deadline = time.time() + 45
+        deadline = time.time() + 30  # Giảm timeout
         while len(live_accs) < n and time.time() < deadline:
-            time.sleep(0.3)
+            time.sleep(0.2)
         stop_flag.set()
     return live_accs[:n]
 
@@ -402,7 +405,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚫 Spam!")
         return
 
-    # Lấy lock của user để tránh xung đột (không ảnh hưởng user khác)
+    # Lấy lock riêng của user
     async with user_locks[uid]:
         if data.startswith("lay_"):
             n = int(data.split("_")[1])
@@ -432,8 +435,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text(f"⏳ Đang lấy {n} acc...")
             t0 = time.time()
-            loop = asyncio.get_event_loop()
-            accs = await loop.run_in_executor(None, fetch_fast, n)
+            # Dùng global_executor thay vì None
+            accs = await asyncio.get_event_loop().run_in_executor(global_executor, fetch_fast, n)
             t1 = time.time() - t0
             if not accs:
                 await query.edit_message_text("❌ Không lấy được acc.")
@@ -456,7 +459,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if need_save:
                 save_data()
 
-            # Chuẩn bị nút check (tối đa 5 acc)
+            # Chuẩn bị nút check (tối đa 5)
             with users_lock:
                 if uid == ADMIN_ID:
                     check_rem = 99999
@@ -471,7 +474,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             check_buttons = []
             if can_check >= 5:
                 check_buttons.append(InlineKeyboardButton("✅ Check 5", callback_data="checkacc_5"))
-            # Có thể thêm tùy chọn ít hơn nếu còn đủ
             if can_check >= 3:
                 check_buttons.append(InlineKeyboardButton("Check 3", callback_data="checkacc_3"))
             reply_markup = InlineKeyboardMarkup([check_buttons]) if check_buttons else None
@@ -505,7 +507,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parts = data.split("_")
             if len(parts) != 2: return
             req_count = int(parts[1])
-            # Giới hạn tối đa 5
             if req_count > MAX_CHECK_PER_REQ:
                 req_count = MAX_CHECK_PER_REQ
 
@@ -574,7 +575,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if uid != ADMIN_ID:
                 save_data()
 
-            # Cập nhật original message (danh sách acc chờ check còn lại)
+            # Cập nhật original message
             with users_lock:
                 u2 = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
                 new_total = len(new_last)
@@ -767,7 +768,6 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if check_spam(uid):
         await update.message.reply_text("🚫 Spam!")
         return
-    # Sử dụng lock riêng của user
     async with user_locks[uid]:
         with users_lock:
             u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
@@ -797,8 +797,7 @@ async def lay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n = MAX_PER_REQ
 
         msg = await update.message.reply_text(f"⏳ {n} acc...")
-        loop = asyncio.get_event_loop()
-        accs = await loop.run_in_executor(None, fetch_fast, n)
+        accs = await asyncio.get_event_loop().run_in_executor(global_executor, fetch_fast, n)
         if not accs:
             await msg.edit_text("Không lấy được")
             return
