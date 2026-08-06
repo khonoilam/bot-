@@ -51,13 +51,13 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger(__name__)
 
-# ======================== THREAD POOL GỌN HƠN ========================
+# ======================== THREAD POOL ========================
 global_executor = ThreadPoolExecutor(max_workers=50)
 
 # ======================== LOCKS ========================
 keys_lock = threading.Lock()
 users_lock = threading.Lock()
-acc_lock = asyncio.Lock()           # SỬA: dùng asyncio.Lock thay vì threading.Lock
+acc_lock = asyncio.Lock()           # Sửa thành asyncio.Lock
 spam_lock = threading.Lock()
 data_lock = threading.Lock()
 
@@ -65,7 +65,7 @@ data_lock = threading.Lock()
 keys = {}
 users = {}
 used_accounts = set()
-active_tasks = {}
+active_tasks = {}  # uid -> asyncio.Task (fetch hoặc check)
 
 HEADERS = {
     "authority": "tangacc.net", "accept": "*/*", "accept-language": "en-US,en;q=0.9",
@@ -113,7 +113,6 @@ def load_data():
         except Exception as e: log.error(f"Lỗi tải bin: {e}")
 
 def save_data_sync():
-    """Ghi dữ liệu đồng bộ, được gọi trong thread riêng để không block event loop"""
     with data_lock:
         for attempt in range(2):
             try:
@@ -128,7 +127,6 @@ def save_data_sync():
             time.sleep(1)
 
 async def save_data():
-    """Chạy save_data_sync trong thread pool để không block event loop"""
     await asyncio.get_event_loop().run_in_executor(global_executor, save_data_sync)
 
 def get_acc_sync():
@@ -393,72 +391,80 @@ async def button_handler(update, context):
             can_check = min(req_count, len(acc_list), remaining)
             if can_check <= 0: await query.edit_message_text("🚫 Hết lượt check."); return
             accs_to_check = acc_list[:can_check]
+        # Không await, tạo background task
+        if uid in active_tasks and not active_tasks[uid].done():
+            await query.answer("Đang xử lý, vui lòng đợi.", show_alert=True); return
         wait_msg = await context.bot.send_message(chat_id=uid, text=f"🔍 Đang check {can_check} acc...")
-        t0 = time.time()
-        sem = asyncio.Semaphore(CHECK_CONCURRENT)
-        async with aiohttp.ClientSession() as session:
-            async def limited_check(acc_str):
-                if "|" not in acc_str: return {"status":"ERROR"}
-                uname, pwd = acc_str.split("|",1)
-                async with sem: return await check_acc_new(session, uname, pwd)
-            results = await asyncio.gather(*[limited_check(a) for a in accs_to_check])
-        t1 = time.time() - t0
-        success_results = [r for r in results if r["status"] in ("HIT","MISS")]
-        hit_details = []
-        for r in results:
-            if r["status"] == "HIT":
-                hit_details.append({
-                    "username":r["username"],"name":r.get("name","?"),"rank":r.get("rank","?"),
-                    "level":r.get("level","?"),"skins":r.get("skins",0),"champs":r.get("champs",0),
-                    "banned":r.get("banned","NO"),"ban_start":r.get("ban_start",""),"ban_end":r.get("ban_end",""),
-                    "fb_linked":r.get("fb_linked","?"),"mobile_bound":r.get("mobile_bound","?"),
-                    "email_verified":r.get("email_verified","?"),"rare":r.get("rare","Không"),"shells":r.get("shells",0)
-                })
-        with users_lock:
-            u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
-            if success_results: update_check_count(uid, len(success_results), hit_details)
-            new_last = acc_list[can_check:] if len(acc_list) > can_check else []
-            u["last_acc"] = new_last
-        if uid != ADMIN_ID: await save_data()
-        with users_lock:
-            u2 = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin",{})
-            new_total = len(new_last)
-            today = today_vn()
-            if u2.get("last_check_date") != today: check_rem = CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL
-            else: check_rem = max(0, (CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL) - u2.get("checked_today",0))
-        can_check_new = min(new_total, check_rem); new_check_buttons = []
-        if can_check_new >= 5: new_check_buttons.append(InlineKeyboardButton("✅ Check 5", callback_data="checkacc_5"))
-        if can_check_new >= 3: new_check_buttons.append(InlineKeyboardButton("Check 3", callback_data="checkacc_3"))
-        new_reply_markup = InlineKeyboardMarkup([new_check_buttons]) if new_check_buttons else None
-        new_acc_text = "\n".join(new_last[:20])
-        if new_total > 20: new_acc_text += f"\n... và {new_total-20} acc khác"
-        new_msg_text = f"🎉 Còn {new_total} acc chưa check\n\n{new_acc_text}" if new_total > 0 else "✅ Đã check hết acc."
-        try: await original_msg.edit_text(new_msg_text, reply_markup=new_reply_markup)
-        except Exception as e: log.error(f"Không thể cập nhật: {e}")
-        hit = [r for r in results if r["status"] == "HIT"]
-        miss = [r for r in results if r["status"] != "HIT"]
-        text = f"📊 Kết quả check {len(results)} acc ({t1:.1f}s)\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
-        if hit:
-            text += "\nChi tiết HIT:\n"
-            for r in hit:
-                ban_text = "Không"
-                if r.get("banned") == "YES":
-                    ban_text = "Có"
-                    if r.get("ban_start") and r.get("ban_end"): ban_text += f" ({r['ban_start']} → {r['ban_end']})"
-                    elif r.get("ban_start"): ban_text += f" (từ {r['ban_start']})"
-                text += (f"👤 {r['username']} - {r.get('name','?')}\n"
-                         f"   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n"
-                         f"   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)} | Sò: {r.get('shells',0)}\n"
-                         f"   Ban: {ban_text}\n"
-                         f"   FB: {r.get('fb_linked','?')} | SĐT: {r.get('mobile_bound','?')} | Email: {r.get('email_verified','?')}\n"
-                         f"   Hiếm: {r.get('rare','Không')}\n")
-        if miss:
-            text += "\nMISS/ERROR:\n"
-            for r in miss[:5]: text += f"❌ {r['username']} - {r.get('message','?')}\n"
-        if len(text) > 4000: text = text[:4000] + "\n..."
-        await wait_msg.edit_text(text)
-        kb, menu_text = main_menu(uid)
-        if kb: await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
+
+        async def check_and_send():
+            try:
+                sem = asyncio.Semaphore(CHECK_CONCURRENT)
+                async with aiohttp.ClientSession() as session:
+                    async def limited_check(acc_str):
+                        if "|" not in acc_str: return {"status":"ERROR"}
+                        uname, pwd = acc_str.split("|",1)
+                        async with sem: return await check_acc_new(session, uname, pwd)
+                    results = await asyncio.gather(*[limited_check(a) for a in accs_to_check])
+                t1 = time.time() - time.time()  # placeholder, sẽ tính sau
+                success_results = [r for r in results if r["status"] in ("HIT","MISS")]
+                hit_details = []
+                for r in results:
+                    if r["status"] == "HIT":
+                        hit_details.append({
+                            "username":r["username"],"name":r.get("name","?"),"rank":r.get("rank","?"),
+                            "level":r.get("level","?"),"skins":r.get("skins",0),"champs":r.get("champs",0),
+                            "banned":r.get("banned","NO"),"ban_start":r.get("ban_start",""),"ban_end":r.get("ban_end",""),
+                            "fb_linked":r.get("fb_linked","?"),"mobile_bound":r.get("mobile_bound","?"),
+                            "email_verified":r.get("email_verified","?"),"rare":r.get("rare","Không"),"shells":r.get("shells",0)
+                        })
+                with users_lock:
+                    u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin", {})
+                    if success_results: update_check_count(uid, len(success_results), hit_details)
+                    new_last = acc_list[can_check:] if len(acc_list) > can_check else []
+                    u["last_acc"] = new_last
+                if uid != ADMIN_ID: await save_data()
+                # Cập nhật original message
+                with users_lock:
+                    u2 = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin",{})
+                    new_total = len(new_last)
+                    today = today_vn()
+                    if u2.get("last_check_date") != today: check_rem = CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL
+                    else: check_rem = max(0, (CHECK_LIMIT_VIP if u2.get("vip") else CHECK_LIMIT_NORMAL) - u2.get("checked_today",0))
+                can_check_new = min(new_total, check_rem); new_check_buttons = []
+                if can_check_new >= 5: new_check_buttons.append(InlineKeyboardButton("✅ Check 5", callback_data="checkacc_5"))
+                if can_check_new >= 3: new_check_buttons.append(InlineKeyboardButton("Check 3", callback_data="checkacc_3"))
+                new_reply_markup = InlineKeyboardMarkup([new_check_buttons]) if new_check_buttons else None
+                new_acc_text = "\n".join(new_last[:20])
+                if new_total > 20: new_acc_text += f"\n... và {new_total-20} acc khác"
+                new_msg_text = f"🎉 Còn {new_total} acc chưa check\n\n{new_acc_text}" if new_total > 0 else "✅ Đã check hết acc."
+                try: await original_msg.edit_text(new_msg_text, reply_markup=new_reply_markup)
+                except Exception as e: log.error(f"Không thể cập nhật: {e}")
+                # Kết quả check
+                hit = [r for r in results if r["status"] == "HIT"]
+                miss = [r for r in results if r["status"] != "HIT"]
+                text = f"📊 Kết quả check {len(results)} acc\n\n✅ HIT: {len(hit)}\n❌ MISS/ERROR: {len(miss)}\n"
+                if hit:
+                    text += "\nChi tiết HIT:\n"
+                    for r in hit:
+                        ban_text = "Không"
+                        if r.get("banned") == "YES":
+                            ban_text = "Có"
+                            if r.get("ban_start") and r.get("ban_end"): ban_text += f" ({r['ban_start']} → {r['ban_end']})"
+                            elif r.get("ban_start"): ban_text += f" (từ {r['ban_start']})"
+                        text += (f"👤 {r['username']} - {r.get('name','?')}\n"
+                                 f"   Rank: {r.get('rank','?')} | Lv: {r.get('level','?')}\n"
+                                 f"   Skin: {r.get('skins',0)} | Tướng: {r.get('champs',0)} | Sò: {r.get('shells',0)}\n"
+                                 f"   Ban: {ban_text}\n"
+                                 f"   FB: {r.get('fb_linked','?')} | SĐT: {r.get('mobile_bound','?')} | Email: {r.get('email_verified','?')}\n"
+                                 f"   Hiếm: {r.get('rare','Không')}\n")
+                if miss:
+                    text += "\nMISS/ERROR:\n"
+                    for r in miss[:5]: text += f"❌ {r['username']} - {r.get('message','?')}\n"
+                await wait_msg.edit_text(text)
+                kb, menu_text = main_menu(uid)
+                if kb: await context.bot.send_message(chat_id=uid, text=menu_text, reply_markup=kb)
+            except Exception as e: log.error(f"Lỗi check background: {e}")
+        active_tasks[uid] = asyncio.create_task(check_and_send())
 
     elif data == "export":
         with users_lock: u = users.get(str(uid)) if uid != ADMIN_ID else users.setdefault("admin",{"history":[]}); history = list(u.get("history",[]))
@@ -525,6 +531,7 @@ async def key_cmd(update, context):
     await update.message.reply_text(f"✅ {'👑 VIP' if is_vip else '🔑 Thường'} | {limit} acc/ngày\nCheck: {CHECK_LIMIT_VIP if is_vip else CHECK_LIMIT_NORMAL}/ngày\n⏳ Key tồn tại 24h.", reply_markup=kb)
 
 async def lay(update, context):
+    # Tương tự như button_handler lay_
     uid = update.effective_user.id
     with users_lock:
         if uid == ADMIN_ID: auth=True
