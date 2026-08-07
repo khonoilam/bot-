@@ -130,16 +130,28 @@ async def fetch_fast_async(n):
 
 # ======================== CHECK ACC (FALLBACK 3 API) ========================
 async def _try_check_api(url, username, password, apikey=None):
-    """Gọi 1 API check, trả về dict kết quả nếu thành công, None nếu lỗi"""
+    """
+    Gọi 1 API check.
+    Trả về dict kết quả nếu API phản hồi hợp lệ (HIT hoặc MISS).
+    Trả về None CHỈ KHI lỗi kết nối, timeout, HTTP không phải 200, hoặc response không parse được.
+    """
     data = {"user": username, "pass": password}
     if apikey: data["apikey"] = apikey
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT)) as resp:
-                if resp.status != 200: return None
-                d = await resp.json()
-                if not d.get("ok") and "result" not in d: return None
-                if d.get("ok") and d["result"].get("status") == "HIT":
+                if resp.status != 200:
+                    # Lỗi server thực sự
+                    return None
+                try:
+                    d = await resp.json()
+                except:
+                    # Không parse được JSON
+                    return None
+                # Phải có cả 'ok' và 'result' mới coi là response hợp lệ
+                if "ok" not in d or "result" not in d:
+                    return None
+                if d["ok"] and d["result"].get("status") == "HIT":
                     info = d["result"]; skins = info.get("aov_skins",{})
                     ss=skins.get("ss",0); sss=skins.get("sss",0); anime=skins.get("anime",0)
                     rare=[]
@@ -162,17 +174,19 @@ async def _try_check_api(url, username, password, apikey=None):
                             "mobile_bound":"Yes" if info.get("mobile_bound") else "No",
                             "email_verified":"Yes" if info.get("email_verified") else "No","rare":rare_str}
                 else:
-                    return {"status":"MISS","username":username,"message":d.get("result",{}).get("detail","Sai mật khẩu / không tồn tại")}
-    except: return None
+                    # ok=False hoặc status != HIT -> coi là MISS
+                    return {"status":"MISS","username":username,"message":d["result"].get("detail","Sai mật khẩu / không tồn tại")}
+    except:
+        return None
 
 async def check_acc_fallback(username, password):
-    """Thử lần lượt 3 API, trả về kết quả đầu tiên hợp lệ"""
+    """Thử lần lượt 3 API, chỉ chuyển API khi thực sự lỗi"""
     res = await _try_check_api(CHECK_API_1, username, password)
-    if res: return res
+    if res is not None: return res
     res = await _try_check_api(CHECK_API_2, username, password)
-    if res: return res
+    if res is not None: return res
     res = await _try_check_api(CHECK_API_3, username, password, apikey=CHECK_API_KEY)
-    if res: return res
+    if res is not None: return res
     return {"status":"ERROR","username":username,"message":"Tất cả API check đều lỗi"}
 
 # ======================== SPAM ========================
